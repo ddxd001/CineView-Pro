@@ -239,6 +239,7 @@ public final class MonitorViewModel {
     public var statusBannerMessage: String?
 
     // --- 相机实时遥测参数 (A6700) ---
+    public var currentExposureMode: SonyExposureProgramMode?
     public var currentShutter: SonyShutterSpeed = .fraction(1, 50)
     public var isShutterWritable: Bool = true
     public var currentAperture: SonyAperture = SonyAperture(fStop: 2.8)
@@ -276,6 +277,8 @@ public final class MonitorViewModel {
     // --- 内部后台任务 ---
     private var liveViewTask: Task<Void, Never>?
     private var telemetryTask: Task<Void, Never>?
+    private var eventSyncTask: Task<Void, Never>?
+    private var eventDebounceTask: Task<Void, Never>?
     private var recordingTimerTask: Task<Void, Never>?
     private var reticleDismissTask: Task<Void, Never>?
     private var bannerDismissTask: Task<Void, Never>?
@@ -377,6 +380,10 @@ public final class MonitorViewModel {
         liveViewTask = nil
         telemetryTask?.cancel()
         telemetryTask = nil
+        eventSyncTask?.cancel()
+        eventSyncTask = nil
+        eventDebounceTask?.cancel()
+        eventDebounceTask = nil
         recordingTimerTask?.cancel()
         recordingTimerTask = nil
 
@@ -398,6 +405,7 @@ public final class MonitorViewModel {
         currentResolutionLabel = ""
         currentFrameKB = 0
         ptpDiagnosticText = ""
+        currentExposureMode = nil
         shutterPresets = Self.fallbackShutterPresets
         isShutterWritable = true
         aperturePresets = Self.fallbackAperturePresets
@@ -492,7 +500,21 @@ public final class MonitorViewModel {
                 self.ptpDiagnosticText = "0x9209 失败: \(error.localizedDescription)"
             }
 
-            // 启动周期遥测同步与延迟测量 (每 2 秒同步一次)
+            // 监听 Sony Event 通道 (0xC203 属性变更 / 0xC21B 镜头变更 / 0x4006)，物理拨轮转动后 120ms 内即时同步
+            eventSyncTask = Task { [weak self] in
+                let stream = await client.events()
+                for await event in stream {
+                    guard !Task.isCancelled, let self else { break }
+                    let code = event.eventCode
+                    if code == SonyPTPEventCode.sonyDevicePropChanged.rawValue
+                        || code == SonyPTPEventCode.sonyLensInformationChanged.rawValue
+                        || code == SonyPTPEventCode.devicePropChanged.rawValue {
+                        self.scheduleDebouncedStateSync(delayMs: 120)
+                    }
+                }
+            }
+
+            // 启动周期遥测同步与延迟测量 (每 2 秒兜底同步一次)
             telemetryTask = Task { [weak self] in
                 let clock = ContinuousClock()
                 while !Task.isCancelled {
@@ -559,36 +581,62 @@ public final class MonitorViewModel {
         }
     }
 
+    private func scheduleDebouncedStateSync(delayMs: Int) {
+        eventDebounceTask?.cancel()
+        eventDebounceTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(delayMs))
+            guard !Task.isCancelled, let self, let activeClient = self.ptpClient else { return }
+            do {
+                let snap = try await activeClient.fetchCameraState()
+                self.applySnapshot(snap)
+            } catch {
+                self.ptpDiagnosticText = "0x9209 事件同步异常: \(error.localizedDescription)"
+            }
+        }
+    }
+
     private func applySnapshot(_ snap: CameraStateSnapshot) {
         ptpDiagnosticText = snap.diagnosticSummary
+        if let mode = snap.exposureProgramMode {
+            currentExposureMode = mode
+        }
 
         if let shutter = snap.shutterSpeed { currentShutter = shutter }
         if let writable = snap.isShutterWritable {
             isShutterWritable = writable
-            if !snap.availableShutterSpeeds.isEmpty {
-                shutterPresets = snap.availableShutterSpeeds
-            } else if !writable {
+            if !writable {
                 shutterPresets = []
+                if activeExposureControl == .shutter {
+                    activeExposureControl = nil
+                }
+            } else if !snap.availableShutterSpeeds.isEmpty {
+                shutterPresets = snap.availableShutterSpeeds
             }
         }
 
         if let aperture = snap.aperture { currentAperture = aperture }
         if let writable = snap.isApertureWritable {
             isApertureWritable = writable
-            if !snap.availableApertures.isEmpty {
-                aperturePresets = snap.availableApertures
-            } else if !writable {
+            if !writable {
                 aperturePresets = []
+                if activeExposureControl == .aperture {
+                    activeExposureControl = nil
+                }
+            } else if !snap.availableApertures.isEmpty {
+                aperturePresets = snap.availableApertures
             }
         }
 
         if let iso = snap.iso { currentISO = iso }
         if let writable = snap.isISOWritable {
             isISOWritable = writable
-            if !snap.availableISOs.isEmpty {
-                isoPresets = snap.availableISOs
-            } else if !writable {
+            if !writable {
                 isoPresets = []
+                if activeExposureControl == .iso {
+                    activeExposureControl = nil
+                }
+            } else if !snap.availableISOs.isEmpty {
+                isoPresets = snap.availableISOs
             }
         }
         if let wb = snap.whiteBalance { currentWhiteBalance = wb }
@@ -612,8 +660,13 @@ public final class MonitorViewModel {
         currentShutter = value
         guard let client = ptpClient else { return }
         Task {
-            do { try await client.setShutterSpeed(value) }
-            catch { showBanner("快门设置失败: \(error.localizedDescription)") }
+            do {
+                try await client.setShutterSpeed(value)
+                scheduleDebouncedStateSync(delayMs: 180)
+            } catch {
+                showBanner("快门设置失败: \(error.localizedDescription)")
+                scheduleDebouncedStateSync(delayMs: 150)
+            }
         }
     }
 
@@ -621,8 +674,13 @@ public final class MonitorViewModel {
         currentAperture = value
         guard let client = ptpClient else { return }
         Task {
-            do { try await client.setAperture(value) }
-            catch { showBanner("光圈设置失败: \(error.localizedDescription)") }
+            do {
+                try await client.setAperture(value)
+                scheduleDebouncedStateSync(delayMs: 180)
+            } catch {
+                showBanner("光圈设置失败: \(error.localizedDescription)")
+                scheduleDebouncedStateSync(delayMs: 150)
+            }
         }
     }
 
@@ -630,8 +688,13 @@ public final class MonitorViewModel {
         currentISO = value
         guard let client = ptpClient else { return }
         Task {
-            do { try await client.setISO(value) }
-            catch { showBanner("ISO 设置失败: \(error.localizedDescription)") }
+            do {
+                try await client.setISO(value)
+                scheduleDebouncedStateSync(delayMs: 180)
+            } catch {
+                showBanner("ISO 设置失败: \(error.localizedDescription)")
+                scheduleDebouncedStateSync(delayMs: 150)
+            }
         }
     }
 
@@ -639,8 +702,12 @@ public final class MonitorViewModel {
         currentWhiteBalance = value
         guard let client = ptpClient else { return }
         Task {
-            do { try await client.setWhiteBalance(value) }
-            catch { showBanner("白平衡设置失败: \(error.localizedDescription)") }
+            do {
+                try await client.setWhiteBalance(value)
+                scheduleDebouncedStateSync(delayMs: 180)
+            } catch {
+                showBanner("白平衡设置失败: \(error.localizedDescription)")
+            }
         }
     }
 
@@ -649,8 +716,12 @@ public final class MonitorViewModel {
         currentWhiteBalance = .colorTempFilter
         guard let client = ptpClient else { return }
         Task {
-            do { try await client.setColorTemperature(kelvin, ensureColorTempMode: true) }
-            catch { showBanner("色温设置失败: \(error.localizedDescription)") }
+            do {
+                try await client.setColorTemperature(kelvin, ensureColorTempMode: true)
+                scheduleDebouncedStateSync(delayMs: 180)
+            } catch {
+                showBanner("色温设置失败: \(error.localizedDescription)")
+            }
         }
     }
 
@@ -658,8 +729,12 @@ public final class MonitorViewModel {
         currentExposureBias = bias
         guard let client = ptpClient else { return }
         Task {
-            do { try await client.setExposureBias(bias) }
-            catch { showBanner("曝光补偿设置失败: \(error.localizedDescription)") }
+            do {
+                try await client.setExposureBias(bias)
+                scheduleDebouncedStateSync(delayMs: 180)
+            } catch {
+                showBanner("曝光补偿设置失败: \(error.localizedDescription)")
+            }
         }
     }
 
@@ -968,13 +1043,13 @@ public struct ContentView: View {
                             Spacer()
                         }
                         .padding(.leading, 16)
-                        .padding(.bottom, vm.activeExposureControl != nil || vm.activeToolInspector != nil ? 104 : 20)
+                        .padding(.bottom, vm.activeExposureControl != nil || vm.activeToolInspector != nil ? 108 : 56)
                     }
                     .transition(.scale(scale: 0.92).combined(with: .opacity))
                 }
 
                 // ---------------------------------------------------------
-                // LAYER 2: 顶部悬浮状态栏 + 右侧专业工具栏 + 底部快捷滚轮/子菜单
+                // LAYER 2: 顶部悬浮状态栏 + 右侧专业工具栏 + 左下角档位徽标 + 底部快捷滚轮/子菜单
                 // ---------------------------------------------------------
                 if !vm.isHUDHidden {
                     VStack(spacing: 0) {
@@ -1001,6 +1076,18 @@ public struct ContentView: View {
                         bottomContextualDrawer
                             .padding(.bottom, 12)
                     }
+
+                    // 左下角：当前机身曝光档位徽标 (A / S / M / P / AUTO / MOVIE M / S&Q 等)
+                    VStack {
+                        Spacer()
+                        HStack {
+                            bottomLeftExposureModeBadge
+                            Spacer()
+                        }
+                        .padding(.leading, 18)
+                        .padding(.bottom, vm.activeExposureControl != nil || vm.activeToolInspector != nil ? 98 : 16)
+                    }
+                    .animation(.snappy(duration: 0.2), value: vm.activeExposureControl != nil || vm.activeToolInspector != nil)
 
                     // 右侧悬浮垂直工具栏
                     HStack {
@@ -1405,9 +1492,47 @@ public struct ContentView: View {
             .frame(width: 0.5, height: 16)
     }
 
+    private func isControlWritable(_ control: ActiveExposureControl) -> Bool {
+        switch control {
+        case .aperture: return vm.isApertureWritable
+        case .shutter:  return vm.isShutterWritable
+        case .iso:      return vm.isISOWritable
+        case .exposureBias, .whiteBalance: return true
+        }
+    }
+
+    private func lockedReasonMessage(for control: ActiveExposureControl) -> String {
+        let modeText = vm.currentExposureMode?.shortBadge
+        switch control {
+        case .aperture:
+            if vm.currentExposureMode?.allowsManualAperture == false, let modeText {
+                return "当前 \(modeText) 档位由机身自动控制光圈，不可手动调节"
+            }
+            return "当前镜头不支持电控光圈，或光圈环未拧至 A 档"
+        case .shutter:
+            if vm.currentExposureMode?.allowsManualShutter == false, let modeText {
+                return "当前 \(modeText) 档位由机身自动控制快门，不可手动调节"
+            }
+            return "当前拍摄模式下快门不可手动调节"
+        case .iso:
+            if let modeText {
+                return "当前 \(modeText) 档位下 ISO 不可手动调节"
+            }
+            return "当前拍摄模式下 ISO 不可手动调节"
+        case .exposureBias, .whiteBalance:
+            return ""
+        }
+    }
+
     private func exposurePillCell(label: String, value: String, control: ActiveExposureControl) -> some View {
-        let isSelected = vm.activeExposureControl == control
+        let writable = isControlWritable(control)
+        let isSelected = writable && vm.activeExposureControl == control
         return Button {
+            guard writable else {
+                let msg = lockedReasonMessage(for: control)
+                if !msg.isEmpty { vm.showBanner(msg) }
+                return
+            }
             withAnimation(.snappy(duration: 0.2)) {
                 vm.activeToolInspector = nil
                 vm.activeExposureControl = isSelected ? nil : control
@@ -1416,16 +1541,63 @@ public struct ContentView: View {
             HStack(spacing: 4) {
                 Text(label)
                     .font(.system(size: 9, weight: .bold, design: .monospaced))
-                    .foregroundStyle(isSelected ? .black.opacity(0.75) : .white.opacity(0.5))
+                    .foregroundStyle(isSelected ? .black.opacity(0.75) : .white.opacity(writable ? 0.5 : 0.3))
                 Text(value)
                     .font(.system(size: 12, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(isSelected ? .black : .white)
+                    .foregroundStyle(isSelected ? .black : .white.opacity(writable ? 1.0 : 0.45))
+                if !writable {
+                    Image(systemName: "lock.fill")
+                        .font(.system(size: 8, weight: .bold))
+                        .foregroundStyle(.white.opacity(0.38))
+                }
             }
             .padding(.horizontal, 9)
             .padding(.vertical, 5)
             .background(isSelected ? Color.yellow : Color.clear, in: Capsule())
         }
         .buttonStyle(.plain)
+    }
+
+    /// 左下角：当前相机曝光档位徽标 (如 A / S / M / P / AUTO / MOVIE M / S&Q M)
+    private var bottomLeftExposureModeBadge: some View {
+        let badgeText: String = {
+            if let mode = vm.currentExposureMode {
+                return mode.shortBadge
+            }
+            if vm.isTestPatternActive {
+                return "SIM"
+            }
+            return vm.isCameraConnected ? "--" : "OFFLINE"
+        }()
+        let isMovie = vm.currentExposureMode?.isMovieMode == true
+        let isActive = vm.currentExposureMode != nil
+
+        return HStack(spacing: 6) {
+            Image(systemName: isMovie ? "video.fill" : "dial.medium.fill")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(isMovie ? .red : (isActive ? .yellow : .white.opacity(0.45)))
+
+            Text(badgeText)
+                .font(.system(size: 13, weight: .heavy, design: .monospaced))
+                .foregroundStyle(isActive ? .white : .white.opacity(0.5))
+
+            if let mode = vm.currentExposureMode {
+                Divider()
+                    .frame(height: 11)
+                    .background(.white.opacity(0.25))
+                Text(mode.displayName)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.72))
+            }
+        }
+        .padding(.horizontal, 11)
+        .padding(.vertical, 6)
+        .background(.black.opacity(0.74), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(isActive ? Color.yellow.opacity(0.45) : Color.white.opacity(0.14), lineWidth: 0.7)
+        )
+        .allowsHitTesting(false)
     }
 
     // MARK: - LAYER 2B: 右侧悬浮专业工具栏

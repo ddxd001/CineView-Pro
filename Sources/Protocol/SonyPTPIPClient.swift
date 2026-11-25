@@ -112,6 +112,8 @@ public enum SonyPTPPropCode: UInt16, Sendable {
     case whiteBalance      = 0x5005
     /// 光圈值 F-Number (UInt16，实际值 × 100，例如 f/2.8 -> 280 = 0x0118)
     case fNumber           = 0x5007
+    /// 拍摄曝光模式 Exposure Program Mode (SDI2: UInt16 / SDI3: UInt32，低 16 位对应 M/P/A/S/Movie/S&Q)
+    case exposureProgramMode = 0x500E
     /// 曝光补偿 Exposure Bias Compensation (Int16，单位 1/1000 EV，如 -1000 = -1.0 EV, +300 = +0.3 EV)
     case exposureBias      = 0x5010
 
@@ -473,6 +475,147 @@ public struct SonyExposureBias: Equatable, Hashable, Sendable, CustomStringConve
     ].map(SonyExposureBias.init(rawMilliEV:))
 }
 
+/// Sony 拍摄模式 / 曝光档位 (`0x500E` ExposureProgramMode)
+/// - 参考 `libgphoto2` (`sony_exposure_program_32_modes` / `exposure_program_modes`)：
+///   SDI3 (A6700 / BIONZ XR) 为 `UInt32`（如 `0x00020003` = A 档, `0x00078051` = 视频 A 档），
+///   SDI2 为 `UInt16`（如 `0x0003` = A 档, `0x8051` = 视频 A 档），两者低 16 位编码完全一致。
+public struct SonyExposureProgramMode: Equatable, Hashable, Sendable, CustomStringConvertible {
+    public let rawValue: UInt32
+
+    public init(rawValue: UInt32) {
+        self.rawValue = rawValue
+    }
+
+    public init(rawValue16: UInt16) {
+        self.rawValue = UInt32(rawValue16)
+    }
+
+    /// 统一低 16 位模式码（兼容 SDI2 UInt16 与 SDI3 UInt32）
+    public var modeCode: UInt16 {
+        UInt16(rawValue & 0xFFFF)
+    }
+
+    /// 是否处于视频 / S&Q / HFR 摄像模式
+    public var isMovieMode: Bool {
+        switch modeCode {
+        case 0x8050...0x8054, 0x8059...0x805D, 0x8080...0x8088, 0x808A, 0x8090...0x8097:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// 左下角角标短名称（如 `A`, `M`, `S`, `P`, `AUTO`, `M·A`, `S&Q M`）
+    public var shortBadge: String {
+        switch modeCode {
+        case 0x0001: return "M"
+        case 0x0002: return "P"
+        case 0x0003: return "A"
+        case 0x0004: return "S"
+        case 0x8000: return "AUTO"
+        case 0x8001: return "AUTO+"
+        case 0x8008: return "P·A"
+        case 0x8009: return "P·S"
+        case 0x8011...0x801C: return "SCN"
+        case 0x8020: return "MR"
+        case 0x8040, 0x8041: return "PANO"
+        case 0x8050: return "MOVIE P"
+        case 0x8051: return "MOVIE A"
+        case 0x8052: return "MOVIE S"
+        case 0x8053: return "MOVIE M"
+        case 0x8054: return "MOVIE AUTO"
+        case 0x8059, 0x8084: return "S&Q P"
+        case 0x805A, 0x8085: return "S&Q A"
+        case 0x805B, 0x8086: return "S&Q S"
+        case 0x805C, 0x8087: return "S&Q M"
+        case 0x805D: return "S&Q AUTO"
+        case 0x8080: return "HFR P"
+        case 0x8081: return "HFR A"
+        case 0x8082: return "HFR S"
+        case 0x8083: return "HFR M"
+        case 0x8088: return "MOVIE"
+        case 0x8089: return "STILL"
+        case 0x808A, 0x8090: return "MOVIE F"
+        case 0x8091: return "S&Q F"
+        case 0x8092: return "INT F"
+        case 0x8093: return "INT P"
+        case 0x8094: return "INT A"
+        case 0x8095: return "INT S"
+        case 0x8096: return "INT M"
+        case 0x8097: return "INT AUTO"
+        default:
+            return String(format: "0x%04X", modeCode)
+        }
+    }
+
+    /// 中文可读说明
+    public var displayName: String {
+        switch modeCode {
+        case 0x0001: return "M 手动曝光"
+        case 0x0002: return "P 程序自动"
+        case 0x0003: return "A 光圈优先"
+        case 0x0004: return "S 快门优先"
+        case 0x8000: return "AUTO 智能自动"
+        case 0x8001: return "AUTO+ 增强自动"
+        case 0x8011...0x801C: return "SCN 场景选择"
+        case 0x8020: return "MR 调出存储"
+        case 0x8050: return "视频 P"
+        case 0x8051: return "视频 A"
+        case 0x8052: return "视频 S"
+        case 0x8053: return "视频 M"
+        case 0x8054: return "视频 AUTO"
+        case 0x8059, 0x8084: return "S&Q P"
+        case 0x805A, 0x8085: return "S&Q A"
+        case 0x805B, 0x8086: return "S&Q S"
+        case 0x805C, 0x8087: return "S&Q M"
+        case 0x805D: return "S&Q AUTO"
+        case 0x808A, 0x8090: return "视频灵活曝光"
+        case 0x8091: return "S&Q 灵活曝光"
+        default: return shortBadge
+        }
+    }
+
+    public var description: String { shortBadge }
+
+    /// 当前曝光档位从物理定义上是否允许手动调节光圈（`nil` 表示未知/灵活模式，以机身 isEnabled 为准）
+    public var allowsManualAperture: Bool? {
+        switch modeCode {
+        case 0x0001, 0x0003,
+             0x8051, 0x8053,
+             0x805A, 0x805C, 0x8081, 0x8083, 0x8085, 0x8087,
+             0x8094, 0x8096:
+            return true
+        case 0x0002, 0x0004,
+             0x8000, 0x8001, 0x8011...0x801C, 0x8040, 0x8041,
+             0x8050, 0x8052, 0x8054,
+             0x8059, 0x805B, 0x805D, 0x8080, 0x8082, 0x8084, 0x8086,
+             0x8093, 0x8095, 0x8097:
+            return false
+        default:
+            return nil
+        }
+    }
+
+    /// 当前曝光档位从物理定义上是否允许手动调节快门（`nil` 表示未知/灵活模式，以机身 isEnabled 为准）
+    public var allowsManualShutter: Bool? {
+        switch modeCode {
+        case 0x0001, 0x0004,
+             0x8052, 0x8053,
+             0x805B, 0x805C, 0x8082, 0x8083, 0x8086, 0x8087,
+             0x8095, 0x8096:
+            return true
+        case 0x0002, 0x0003,
+             0x8000, 0x8001, 0x8011...0x801C, 0x8040, 0x8041,
+             0x8050, 0x8051, 0x8054,
+             0x8059, 0x805A, 0x805D, 0x8080, 0x8081, 0x8084, 0x8085,
+             0x8093, 0x8094, 0x8097:
+            return false
+        default:
+            return nil
+        }
+    }
+}
+
 /// 触控对焦归一化坐标 (0.0...1.0) -> 映射为 Sony LiveView 640×480 坐标系
 public struct TouchFocusPoint: Equatable, Sendable {
     /// 归一化水平坐标，0.0 = 最左，1.0 = 最右
@@ -509,12 +652,14 @@ public struct SonyDevicePropertyDescriptor: Sendable {
     public let defaultValueBytes: Data
     /// Enumeration List 1：该属性支持的全部候选值 (原始 LE 字节数组)
     public let supportedValuesBytes: [Data]
-    /// Enumeration List 2 (Sony SDI3 0x012C)：当前机身档位与当前镜头焦段下「实际可设置」的候选值
+    /// Enumeration List 2 (Sony SDI3 / 2023+ 机型)：当前机身档位与当前镜头焦段下「实际可设置」的候选值
     public let settableValuesBytes: [Data]
+    /// 是否实际解析到了第二张枚举表（若为 true 且 settableValuesBytes 为空，表示当前档位下 0 项可调，绝不回退到 List 1）
+    public let hasSettableList: Bool
 
-    /// 优先返回 SDI3 当前可用枚举表；若为空则回退至 List 1 支持表
+    /// 若存在第二张当前可用枚举表则严格使用它；否则使用 List 1 支持表
     public var activeEnumValuesBytes: [Data] {
-        !settableValuesBytes.isEmpty ? settableValuesBytes : supportedValuesBytes
+        hasSettableList ? settableValuesBytes : supportedValuesBytes
     }
 
     public var uint16EnumValues: [UInt16] {
@@ -564,11 +709,25 @@ public struct CameraStateSnapshot: Sendable {
     public let whiteBalance: SonyWhiteBalance?
     public let colorTemperature: UInt16?
     public let exposureBias: SonyExposureBias?
+    /// 当前机身拍摄曝光档位 (来自 0x500E ExposureProgramMode，如 A / S / M / P / Movie M)
+    public let exposureProgramMode: SonyExposureProgramMode?
     public let isRecording: Bool
     public let isLiveViewEnabled: Bool
     /// 调试诊断摘要（记录 0x9209 返回字节数与解析属性个数，便于真机排查）
     public let diagnosticSummary: String
     public let rawProperties: [UInt16: SonyDevicePropertyDescriptor]
+}
+
+/// Sony / 标准 PTP 常用异步事件码
+public enum SonyPTPEventCode: UInt16, Sendable {
+    /// 标准 PTP: 设备属性变更
+    case devicePropChanged           = 0x4006
+    /// Sony 私有: 新对象添加 (如连拍/拍照完成)
+    case sonyObjectAdded             = 0xC201
+    /// Sony 私有: 设备属性变更 (用户转动实体光圈/快门/ISO/模式波轮时立刻触发)
+    case sonyDevicePropChanged       = 0xC203
+    /// Sony 私有: 镜头信息变更 (变焦导致最大光圈变化或更换镜头)
+    case sonyLensInformationChanged  = 0xC21B
 }
 
 /// 异步事件通道收到的相机事件
@@ -1010,26 +1169,41 @@ public actor SonyPTPIPClient {
                 parameters: [0x0000_0002, 0x0000_0000, 0x0000_0000]
             )
 
-            // 6.3 SDIO_GetExtDeviceInfo: OpCode 0x9202, Param1 = 0x0000012C (SDI3=300, A6700/BIONZ XR)
-            // 若机身不支持 SDI3，自动回退至 SDI2 (0x000000C8=200)
+            // 6.3 SDIO_GetExtDeviceInfo: OpCode 0x9202, Params = [0x0000012C (SDI3=300), 0x00000001]
+            // 参考 libgphoto2 (ptp.c:4390): 必须传双参数 [0x012C, 1]，并读取返回载荷前 2 字节确认相机实际协商版本
             var negotiatedVersion = config.preferredSDIOVersion
-            let extInfoResp = try await performTransaction(
+            var extInfoResp = try await performTransaction(
                 opCode: .sdioGetExtDeviceInfo,
                 dataPhase: .noDataOrDataIn,
-                parameters: [negotiatedVersion.rawValue]
+                parameters: [negotiatedVersion.rawValue, 0x0000_0001]
             )
+            if extInfoResp.responseCode != PTPResponseCode.ok.rawValue {
+                // 兼容仅接受单参数的旧机型
+                extInfoResp = try await performTransaction(
+                    opCode: .sdioGetExtDeviceInfo,
+                    dataPhase: .noDataOrDataIn,
+                    parameters: [negotiatedVersion.rawValue]
+                )
+            }
             if extInfoResp.responseCode != PTPResponseCode.ok.rawValue && negotiatedVersion == .v3 {
                 logger.warning("相机拒绝 SDI3 (0x012C)，尝试回退至 SDI2 (0x00C8)")
                 negotiatedVersion = .v2
-                try await executeExpectOK(
+                extInfoResp = try await performTransaction(
                     opCode: .sdioGetExtDeviceInfo,
+                    dataPhase: .noDataOrDataIn,
                     parameters: [negotiatedVersion.rawValue]
                 )
-            } else if extInfoResp.responseCode != PTPResponseCode.ok.rawValue {
+            }
+            guard extInfoResp.responseCode == PTPResponseCode.ok.rawValue else {
                 throw SonyPTPIPError.ptpOperationFailed(
                     opCode: SonyPTPOpCode.sdioGetExtDeviceInfo.rawValue,
                     responseCode: extInfoResp.responseCode
                 )
+            }
+            // 读取相机实际回应的协议版本 (xdata[0..1] UInt16 LE: 0x012C = SDI3, 0x00C8 = SDI2)
+            if extInfoResp.data.count >= 2 {
+                let reportedVer = extInfoResp.data.readUInt16LE(at: 0)
+                negotiatedVersion = (reportedVer >= 0x012C) ? .v3 : .v2
             }
 
             // 6.4 SDIO_Connect Phase 3: OpCode 0x9201, Params = [0x00000003, 0x00000000, 0x00000000]
@@ -1336,8 +1510,8 @@ public actor SonyPTPIPClient {
     // MARK: - 4.4 相机状态获取与常用控制指令封装
 
     /// 一次性拉取相机全部 Sony 扩展属性 (`0x9209 SDIO_GetAllExtDevicePropInfo`) 并解析常用参数快照
-    /// - 自动兼容不同固件的 0x9209 参数签名：`[0, 1]` (SDI3 全量+扩展选项) -> `[0, 0]` -> `[]`
-    /// - 自动自适应 SDI3 双枚举表 / SDI2 单枚举表，避免单个未知字段导致全表解析中断
+    /// - 参数探测顺序参考 `libgphoto2` (`ptp.c:4500`)：`[]` 优先，其次 `[0, 1]` / `[0, 0]` / `[0]`
+    /// - 解析算法严格对照 `libgphoto2` (`ptp-pack.c:805-973`)：按单条属性动态判断是否存在第二张枚举表 (`nextWord < 0x200`)
     @discardableResult
     public func fetchCameraState() async throws -> CameraStateSnapshot {
         let candidateParamLists: [[UInt32]]
@@ -1345,10 +1519,10 @@ public actor SonyPTPIPClient {
             candidateParamLists = [cached]
         } else {
             candidateParamLists = [
-                [0x0000_0000, 0x0000_0001], // Sony SDI3 标准：Param1=0(全量), Param2=1(启用扩展属性)
-                [0x0000_0000, 0x0000_0000], // 备选：Param1=0, Param2=0
-                [0x0000_0000],              // 备选：单参数
-                []                          // 备选：无参数
+                [],                          // libgphoto2 标准：无参数 (A6700 / A7IV / A7RV 实测通用)
+                [0x0000_0000, 0x0000_0001],  // 备选：Param1=0(全量), Param2=1(扩展)
+                [0x0000_0000, 0x0000_0000],  // 备选：Param1=0, Param2=0
+                [0x0000_0000]                // 备选：单参数
             ]
         }
 
@@ -1359,7 +1533,7 @@ public actor SonyPTPIPClient {
                 dataPhase: .noDataOrDataIn,
                 parameters: params
             )
-            if attempt.responseCode == PTPResponseCode.ok.rawValue && !attempt.data.isEmpty {
+            if attempt.responseCode == PTPResponseCode.ok.rawValue && attempt.data.count > 8 {
                 cachedPropInfoParams = params
                 chosenResp = attempt
                 break
@@ -1377,23 +1551,35 @@ public actor SonyPTPIPClient {
             )
         }
 
-        // 同时尝试 SDI3 (双枚举) 与 SDI2 (单枚举) 解析，自动择优取覆盖核心曝光属性更多的一份
-        let prefersSDI3 = (sessionInfo?.negotiatedSDIOVersion ?? .v3) == .v3
-        let primaryParse = Self.parseAllExtDevicePropInfo(resp.data, isSDI3: prefersSDI3)
-        let altParse = Self.parseAllExtDevicePropInfo(resp.data, isSDI3: !prefersSDI3)
-
-        func coreScore(_ map: [UInt16: SonyDevicePropertyDescriptor]) -> Int {
-            var s = map.count
-            if map[SonyPTPPropCode.fNumber.rawValue] != nil { s += 500 }
-            if map[SonyPTPPropCode.shutterSpeed.rawValue] != nil { s += 500 }
-            if map[SonyPTPPropCode.isoSensitivity.rawValue] != nil { s += 500 }
-            if map[SonyPTPPropCode.whiteBalance.rawValue] != nil { s += 500 }
-            return s
-        }
-
-        let chosenParse = coreScore(altParse.properties) > coreScore(primaryParse.properties) ? altParse : primaryParse
-        let props = chosenParse.properties
+        let isSDI3 = (sessionInfo?.negotiatedSDIOVersion ?? .v3) == .v3
+        let parseOutcome = Self.parseAllExtDevicePropInfo(resp.data)
+        let props = parseOutcome.properties
         self.latestProperties = props
+
+        // 解析当前曝光档位 0x500E (SDI3 为 UInt32 如 0x00020003=A，SDI2 为 UInt16 如 0x0003=A)
+        let modeDesc = props[SonyPTPPropCode.exposureProgramMode.rawValue]
+        let exposureMode: SonyExposureProgramMode? = {
+            guard let desc = modeDesc else { return nil }
+            if let u32 = desc.uint32Value {
+                return SonyExposureProgramMode(rawValue: u32)
+            }
+            if let u16 = desc.uint16Value {
+                return SonyExposureProgramMode(rawValue16: u16)
+            }
+            return nil
+        }()
+
+        // 参考 libgphoto2 (ptp-pack.c:822-874):
+        // - SDI3 (mode 3): isEnabled == 1 且 getSet != 0 才可写；isEnabled == 0 (灰显) 或 2 (仅显示) 均为只读
+        // - SDI2 (mode 2): isEnabled == 1 即视为可写（部分属性 getSet 为 0 但支持 0x9207 步进）
+        func evaluateWritable(_ desc: SonyDevicePropertyDescriptor?) -> Bool? {
+            guard let d = desc else { return nil }
+            if isSDI3 {
+                return d.isEnabled == 0x01 && d.getSet != 0x00
+            } else {
+                return d.isEnabled == 0x01
+            }
+        }
 
         let isoDesc = props[SonyPTPPropCode.isoSensitivity.rawValue]
         let iso = isoDesc?.uint32Value.map(SonyISOValue.init(wireValue:))
@@ -1404,7 +1590,7 @@ public actor SonyPTPIPClient {
                 .filter { $0 != 0 && seen.insert($0).inserted }
                 .map(SonyISOValue.init(wireValue:))
         }()
-        let isISOWritable: Bool? = isoDesc.map { $0.getSet != 0x00 && $0.isEnabled == 0x01 }
+        let isISOWritable: Bool? = evaluateWritable(isoDesc)
 
         let shutterDesc = props[SonyPTPPropCode.shutterSpeed.rawValue]
         let shutter = shutterDesc?.uint32Value.map(SonyShutterSpeed.init(wireValue:))
@@ -1415,7 +1601,11 @@ public actor SonyPTPIPClient {
                 .filter { seen.insert($0).inserted }
                 .map(SonyShutterSpeed.init(wireValue:))
         }()
-        let isShutterWritable: Bool? = shutterDesc.map { $0.getSet != 0x00 && $0.isEnabled == 0x01 }
+        let rawShutterWritable = evaluateWritable(shutterDesc)
+        let isShutterWritable: Bool? = {
+            if exposureMode?.allowsManualShutter == false { return false }
+            return rawShutterWritable
+        }()
 
         let apertureDesc = props[SonyPTPPropCode.fNumber.rawValue]
         let aperture = apertureDesc?.uint16Value.map(SonyAperture.init(rawValue:))
@@ -1427,7 +1617,11 @@ public actor SonyPTPIPClient {
                 .sorted()
                 .map(SonyAperture.init(rawValue:))
         }()
-        let isApertureWritable: Bool? = apertureDesc.map { $0.getSet != 0x00 && $0.isEnabled == 0x01 }
+        let rawApertureWritable = evaluateWritable(apertureDesc)
+        let isApertureWritable: Bool? = {
+            if exposureMode?.allowsManualAperture == false { return false }
+            return rawApertureWritable
+        }()
 
         let wb = props[SonyPTPPropCode.whiteBalance.rawValue]?.uint16Value.map(SonyWhiteBalance.init(wireValue:))
         let colorTemp = props[SonyPTPPropCode.colorTemperature.rawValue]?.uint16Value
@@ -1437,10 +1631,11 @@ public actor SonyPTPIPClient {
 
         func flagTag(_ desc: SonyDevicePropertyDescriptor?) -> String {
             guard let d = desc else { return "-" }
-            return "\(d.getSet)/\(d.isEnabled)"
+            return "\(d.getSet)/\(d.isEnabled)/L2:\(d.hasSettableList ? d.settableValuesBytes.count : -1)"
         }
-        let diagBase = "0x9209(\(chosenParse.isSDI3 ? "SDI3" : "SDI2")): \(resp.data.count)B, \(props.count)/\(chosenParse.declaredCount)项 | F:\(availableApertures.count)[\(flagTag(apertureDesc))] SS:\(availableShutterSpeeds.count)[\(flagTag(shutterDesc))] ISO:\(availableISOs.count)[\(flagTag(isoDesc))]"
-        let diag = chosenParse.stopReason.isEmpty ? diagBase : "\(diagBase) | \(chosenParse.stopReason)"
+        let modeLabel = exposureMode?.shortBadge ?? "-"
+        let diagBase = "\(isSDI3 ? "SDI3" : "SDI2") 0x9209: \(resp.data.count)B, \(props.count)/\(parseOutcome.declaredCount)项 | 档位:\(modeLabel) | F:\(availableApertures.count)[\(flagTag(apertureDesc))] SS:\(availableShutterSpeeds.count)[\(flagTag(shutterDesc))] ISO:\(availableISOs.count)[\(flagTag(isoDesc))]"
+        let diag = parseOutcome.stopReason.isEmpty ? diagBase : "\(diagBase) | \(parseOutcome.stopReason)"
 
         return CameraStateSnapshot(
             iso: iso,
@@ -1455,6 +1650,7 @@ public actor SonyPTPIPClient {
             whiteBalance: wb,
             colorTemperature: colorTemp,
             exposureBias: evBias,
+            exposureProgramMode: exposureMode,
             isRecording: isRecording,
             isLiveViewEnabled: isLiveViewEnabled,
             diagnosticSummary: diag,
@@ -1509,11 +1705,28 @@ public actor SonyPTPIPClient {
         return aperture
     }
 
-    /// 修改光圈值 (通过 0x9205 下发 2 字节 UInt16 LE: `fStop × 100`)
+    /// 修改光圈值 (SDI3 通过 0x9205 直接设置，兼容 libgphoto2 的 UInt32 / UInt16 两种负载宽度)
     public func setAperture(_ aperture: SonyAperture) async throws {
-        var payload = Data(capacity: 2)
-        payload.appendUInt16LE(aperture.rawValue)
-        try await setExtDeviceProperty(.fNumber, payload: payload)
+        // 参考 libgphoto2 (config.c:4668): Sony SDI3 模式通过 0x9205 设置 0x5007 时部分固件要求 UInt32 (4B)，部分接受 UInt16 (2B)
+        let reportedType = latestProperties[SonyPTPPropCode.fNumber.rawValue]?.dataType
+        let prefer32 = (reportedType == PTPDataType.uint32.rawValue)
+
+        var payload16 = Data(capacity: 2)
+        payload16.appendUInt16LE(aperture.rawValue)
+        var payload32 = Data(capacity: 4)
+        payload32.appendUInt32LE(UInt32(aperture.rawValue))
+
+        let firstPayload = prefer32 ? payload32 : payload16
+        let fallbackPayload = prefer32 ? payload16 : payload32
+
+        do {
+            try await setExtDeviceProperty(.fNumber, payload: firstPayload)
+        } catch SonyPTPIPError.ptpOperationFailed(_, let code)
+            where code == PTPResponseCode.invalidDevicePropFormat.rawValue
+               || code == PTPResponseCode.invalidDevicePropValue.rawValue
+               || code == PTPResponseCode.generalError.rawValue {
+            try await setExtDeviceProperty(.fNumber, payload: fallbackPayload)
+        }
     }
 
     // --- 白平衡 White Balance (0x5005, UInt16 LE) ---
@@ -2109,31 +2322,29 @@ private extension SonyPTPIPClient {
     struct ExtPropParseOutcome: Sendable {
         let properties: [UInt16: SonyDevicePropertyDescriptor]
         let declaredCount: Int
-        let isSDI3: Bool
         let stopReason: String
     }
 
-    static func parseAllExtDevicePropInfo(_ data: Data, isSDI3: Bool) -> ExtPropParseOutcome {
+    /// 严格对照 `libgphoto2` (`camlibs/ptp2/ptp-pack.c:805-973` `ptp_unpack_Sony_DPD`) 解析 `0x9209` 全量扩展属性表
+    /// - 关键点：Sony 2023/2024+ SDI3 机型（A6700 / A7RV / ZV-E1）中，**并非所有** `FormFlag == 0x02` 属性都带有第二张枚举表！
+    ///   必须在读取完 List 1 后窥视接下来的 2 字节 (`nextWord`)：
+    ///   - 若 `nextWord < 0x200`，表示存在第二张“当前档位/当前镜头实际可设值”枚举表（`count2 = nextWord`，哪怕为 0 也须消费这 2 字节）；
+    ///   - 否则 `nextWord` 就是下一条属性的 `DevicePropCode`（如 `0x5xxx` 或 `0xDxxx`），直接进入下一条解析。
+    static func parseAllExtDevicePropInfo(_ data: Data) -> ExtPropParseOutcome {
         var result: [UInt16: SonyDevicePropertyDescriptor] = [:]
         guard data.count >= 8 else {
-            return ExtPropParseOutcome(properties: result, declaredCount: 0, isSDI3: isSDI3, stopReason: "len<8")
+            return ExtPropParseOutcome(properties: result, declaredCount: 0, stopReason: "len<8")
         }
 
-        // 兼容 8 字节 UInt64 计数头 (bytes 4..7 为 0) 与 4 字节 UInt32 计数头 (bytes 4..7 非 0)
+        // 8 字节计数头: [UInt32 count][UInt32 0] (兼容偶发 4 字节头)
         let lo32 = data.readUInt32LE(at: 0)
         let hi32 = data.readUInt32LE(at: 4)
         let totalCount = Int(lo32)
-        let safeCount = min(totalCount, 2000)
         var cursor = (hi32 == 0) ? 8 : 4
         var stopReason = ""
+        var idx = 0
 
-        for idx in 0..<safeCount {
-            // 至少需要 6 字节头部: PropCode(2) + DataType(2) + GetSet(1) + IsEnable(1)
-            guard cursor + 6 <= data.count else {
-                stopReason = "eof#\(idx)@\(cursor)"
-                break
-            }
-
+        while cursor + 6 <= data.count && idx < 4000 {
             let entryStart = cursor
             let propCode = data.readUInt16LE(at: cursor)
             let dataType = data.readUInt16LE(at: cursor + 2)
@@ -2150,7 +2361,17 @@ private extension SonyPTPIPClient {
 
             // 读取 FormFlag (严格越界保护)
             guard cursor < data.count else {
-                stopReason = "ff-eof#\(idx)@\(cursor)"
+                result[propCode] = SonyDevicePropertyDescriptor(
+                    propertyCode: propCode,
+                    dataType: dataType,
+                    getSet: getSet,
+                    isEnabled: isEnable,
+                    currentValueBytes: currentBytes,
+                    defaultValueBytes: defaultBytes,
+                    supportedValuesBytes: [],
+                    settableValuesBytes: [],
+                    hasSettableList: false
+                )
                 break
             }
             let formFlag = data[data.startIndex + cursor]
@@ -2158,6 +2379,7 @@ private extension SonyPTPIPClient {
 
             var supportedList: [Data] = []
             var settableList: [Data] = []
+            var hasSettableList = false
 
             switch formFlag {
             case 0x00:
@@ -2170,14 +2392,14 @@ private extension SonyPTPIPClient {
                       skipPTPValue(in: data, dataType: dataType, cursor: &cursor),
                       skipPTPValue(in: data, dataType: dataType, cursor: &cursor) else {
                     stopReason = String(format: "rng#\(idx)@\(entryStart) 0x%04X dt=0x%04X", propCode, dataType)
-                    return ExtPropParseOutcome(properties: result, declaredCount: totalCount, isSDI3: isSDI3, stopReason: stopReason)
+                    return ExtPropParseOutcome(properties: result, declaredCount: totalCount, stopReason: stopReason)
                 }
 
             case 0x02:
                 // Enumeration List 1 (全部支持值): UInt16 Count + N × Value
                 guard cursor + 2 <= data.count else {
                     stopReason = String(format: "e1len#\(idx)@\(cursor) 0x%04X", propCode)
-                    return ExtPropParseOutcome(properties: result, declaredCount: totalCount, isSDI3: isSDI3, stopReason: stopReason)
+                    return ExtPropParseOutcome(properties: result, declaredCount: totalCount, stopReason: stopReason)
                 }
                 let count1 = Int(data.readUInt16LE(at: cursor))
                 cursor += 2
@@ -2185,33 +2407,35 @@ private extension SonyPTPIPClient {
                 for _ in 0..<count1 {
                     guard let valBytes = readPTPValueBytes(from: data, dataType: dataType, cursor: &cursor) else {
                         stopReason = String(format: "e1val#\(idx)@\(cursor) 0x%04X c1=\(count1)", propCode)
-                        return ExtPropParseOutcome(properties: result, declaredCount: totalCount, isSDI3: isSDI3, stopReason: stopReason)
+                        return ExtPropParseOutcome(properties: result, declaredCount: totalCount, stopReason: stopReason)
                     }
                     supportedList.append(valBytes)
                 }
 
-                // Sony SDI3 (A6700 / BIONZ XR, 0x012C) 紧跟第二张枚举表 (当前档位/当前镜头焦段实际可选值列表)
-                if isSDI3 {
-                    guard cursor + 2 <= data.count else {
-                        stopReason = String(format: "e2len#\(idx)@\(cursor) 0x%04X", propCode)
-                        return ExtPropParseOutcome(properties: result, declaredCount: totalCount, isSDI3: isSDI3, stopReason: stopReason)
-                    }
-                    let count2 = Int(data.readUInt16LE(at: cursor))
-                    cursor += 2
-                    settableList.reserveCapacity(min(count2, 512))
-                    for _ in 0..<count2 {
-                        guard let valBytes = readPTPValueBytes(from: data, dataType: dataType, cursor: &cursor) else {
-                            stopReason = String(format: "e2val#\(idx)@\(cursor) 0x%04X c2=\(count2)", propCode)
-                            return ExtPropParseOutcome(properties: result, declaredCount: totalCount, isSDI3: isSDI3, stopReason: stopReason)
+                // 关键：严格按 libgphoto2 (ptp-pack.c:932-966) 窥视下 2 字节判断是否紧跟第二张枚举表
+                // 标准与 Sony 扩展属性码均在 0x5xxx / 0xDxxx 区间，故 < 0x200 必为 List 2 元素个数
+                if cursor + 2 <= data.count {
+                    let peekWord = data.readUInt16LE(at: cursor)
+                    if peekWord < 0x0200 {
+                        hasSettableList = true
+                        let count2 = Int(peekWord)
+                        cursor += 2
+                        settableList.reserveCapacity(min(count2, 512))
+                        for _ in 0..<count2 {
+                            guard let valBytes = readPTPValueBytes(from: data, dataType: dataType, cursor: &cursor) else {
+                                stopReason = String(format: "e2val#\(idx)@\(cursor) 0x%04X c2=\(count2)", propCode)
+                                return ExtPropParseOutcome(properties: result, declaredCount: totalCount, stopReason: stopReason)
+                            }
+                            settableList.append(valBytes)
                         }
-                        settableList.append(valBytes)
                     }
                 }
 
             default:
+                // 未知 FormFlag 时记录诊断并退出（避免错位污染后续条目）
                 let sample = data.subdata(in: entryStart..<min(entryStart + 18, data.count)).hexString
                 stopReason = String(format: "ff=0x%02X#\(idx)@\(entryStart) 0x%04X dt=0x%04X [%@]", formFlag, propCode, dataType, sample)
-                return ExtPropParseOutcome(properties: result, declaredCount: totalCount, isSDI3: isSDI3, stopReason: stopReason)
+                return ExtPropParseOutcome(properties: result, declaredCount: totalCount, stopReason: stopReason)
             }
 
             result[propCode] = SonyDevicePropertyDescriptor(
@@ -2222,11 +2446,13 @@ private extension SonyPTPIPClient {
                 currentValueBytes: currentBytes,
                 defaultValueBytes: defaultBytes,
                 supportedValuesBytes: supportedList,
-                settableValuesBytes: settableList
+                settableValuesBytes: settableList,
+                hasSettableList: hasSettableList
             )
+            idx += 1
         }
 
-        return ExtPropParseOutcome(properties: result, declaredCount: totalCount, isSDI3: isSDI3, stopReason: stopReason)
+        return ExtPropParseOutcome(properties: result, declaredCount: totalCount, stopReason: stopReason)
     }
 
     /// 根据 PTP DataType 读取并推进游标，返回原始字节切片
