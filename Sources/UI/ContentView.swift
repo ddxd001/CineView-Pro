@@ -240,6 +240,7 @@ public final class MonitorViewModel {
     // --- 相机实时遥测参数 (A6700) ---
     public var currentShutter: SonyShutterSpeed = .fraction(1, 50)
     public var currentAperture: SonyAperture = SonyAperture(fStop: 2.8)
+    public var isApertureWritable: Bool = true
     public var currentISO: SonyISOValue = .manual(800)
     public var currentExposureBias: SonyExposureBias = SonyExposureBias(rawMilliEV: 0)
     public var currentWhiteBalance: SonyWhiteBalance = .daylight
@@ -295,9 +296,12 @@ public final class MonitorViewModel {
         .fraction(1, 1000), .fraction(1, 2000), .fraction(1, 4000)
     ]
 
-    public let aperturePresets: [SonyAperture] = [
+    private static let fallbackAperturePresets: [SonyAperture] = [
         1.4, 1.8, 2.0, 2.2, 2.5, 2.8, 3.2, 3.5, 4.0, 4.5, 5.0, 5.6, 6.3, 7.1, 8.0, 9.0, 11.0, 13.0, 16.0
     ].map(SonyAperture.init(fStop:))
+
+    /// 动态光圈候选表：联机后严格只展示当前镜头在当前焦段支持的光圈值 (来自 0x9209 属性 0x5007)
+    public var aperturePresets: [SonyAperture] = MonitorViewModel.fallbackAperturePresets
 
     public let isoPresets: [SonyISOValue] = [
         .auto, .manual(100), .manual(160), .manual(200), .manual(320), .manual(400),
@@ -384,6 +388,8 @@ public final class MonitorViewModel {
         currentFPS = 0
         currentResolutionLabel = ""
         currentFrameKB = 0
+        aperturePresets = Self.fallbackAperturePresets
+        isApertureWritable = true
     }
 
     /// 启动内置动态 SMPTE 彩条 + 0-100 IRE 斜坡 + 西门子对焦标板测试信号（模拟器离线仿真专用）
@@ -536,6 +542,12 @@ public final class MonitorViewModel {
     private func applySnapshot(_ snap: CameraStateSnapshot) {
         if let shutter = snap.shutterSpeed { currentShutter = shutter }
         if let aperture = snap.aperture { currentAperture = aperture }
+        isApertureWritable = snap.isApertureWritable
+        if !snap.availableApertures.isEmpty {
+            aperturePresets = snap.availableApertures
+        } else if !snap.isApertureWritable {
+            aperturePresets = []
+        }
         if let iso = snap.iso { currentISO = iso }
         if let wb = snap.whiteBalance { currentWhiteBalance = wb }
         if let k = snap.colorTemperature, k >= 2500, k <= 9900 { currentColorTemp = k }
@@ -1574,12 +1586,19 @@ public struct ContentView: View {
                         }
 
                     case .aperture:
-                        ForEach(vm.aperturePresets, id: \.self) { preset in
-                            wheelChip(
-                                title: preset.description,
-                                isSelected: vm.currentAperture == preset
-                            ) {
-                                vm.setAperture(preset)
+                        if vm.isCameraConnected && (!vm.isApertureWritable || vm.aperturePresets.isEmpty) {
+                            Text("当前镜头或拍摄模式不支持电控光圈（请检查光圈环置于 A 档或切至 A/M 模式）")
+                                .font(.system(size: 11))
+                                .foregroundStyle(.white.opacity(0.65))
+                                .padding(.vertical, 6)
+                        } else {
+                            ForEach(vm.aperturePresets, id: \.self) { preset in
+                                wheelChip(
+                                    title: preset.description,
+                                    isSelected: vm.currentAperture == preset
+                                ) {
+                                    vm.setAperture(preset)
+                                }
                             }
                         }
 

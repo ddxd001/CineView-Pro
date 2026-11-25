@@ -507,6 +507,19 @@ public struct SonyDevicePropertyDescriptor: Sendable {
     public let currentValueBytes: Data
     /// 默认值的原始 Little-Endian 字节
     public let defaultValueBytes: Data
+    /// Enumeration List 1：该属性支持的全部候选值 (原始 LE 字节数组)
+    public let supportedValuesBytes: [Data]
+    /// Enumeration List 2 (Sony SDI3 0x012C)：当前机身档位与当前镜头焦段下「实际可设置」的候选值
+    public let settableValuesBytes: [Data]
+
+    /// 优先返回 SDI3 当前可用枚举表；若为空则回退至 List 1 支持表
+    public var activeEnumValuesBytes: [Data] {
+        !settableValuesBytes.isEmpty ? settableValuesBytes : supportedValuesBytes
+    }
+
+    public var uint16EnumValues: [UInt16] {
+        activeEnumValuesBytes.compactMap { $0.count >= 2 ? $0.readUInt16LE(at: 0) : nil }
+    }
 
     public var uint8Value: UInt8? {
         currentValueBytes.count >= 1 ? currentValueBytes[currentValueBytes.startIndex] : nil
@@ -533,6 +546,10 @@ public struct CameraStateSnapshot: Sendable {
     public let iso: SonyISOValue?
     public let shutterSpeed: SonyShutterSpeed?
     public let aperture: SonyAperture?
+    /// 当前挂载镜头在当前焦段下实际支持调节的全部光圈档位 (来自 0x9209 属性 0x5007 动态枚举表)
+    public let availableApertures: [SonyAperture]
+    /// 当前模式/镜头是否允许通过 PTP 电控调节光圈 (如手动镜头或实体光圈环未拧到 A 时为 false)
+    public let isApertureWritable: Bool
     public let whiteBalance: SonyWhiteBalance?
     public let colorTemperature: UInt16?
     public let exposureBias: SonyExposureBias?
@@ -1324,7 +1341,17 @@ public actor SonyPTPIPClient {
 
         let iso = props[SonyPTPPropCode.isoSensitivity.rawValue]?.uint32Value.map(SonyISOValue.init(wireValue:))
         let shutter = props[SonyPTPPropCode.shutterSpeed.rawValue]?.uint32Value.map(SonyShutterSpeed.init(wireValue:))
-        let aperture = props[SonyPTPPropCode.fNumber.rawValue]?.uint16Value.map(SonyAperture.init(rawValue:))
+        let apertureDesc = props[SonyPTPPropCode.fNumber.rawValue]
+        let aperture = apertureDesc?.uint16Value.map(SonyAperture.init(rawValue:))
+        let availableApertures: [SonyAperture] = {
+            guard let desc = apertureDesc else { return [] }
+            var seen = Set<UInt16>()
+            return desc.uint16EnumValues
+                .filter { $0 > 0 && $0 < 0xFFFF && seen.insert($0).inserted }
+                .sorted()
+                .map(SonyAperture.init(rawValue:))
+        }()
+        let isApertureWritable = (apertureDesc?.getSet == 0x01) && (apertureDesc?.isEnabled == 0x01)
         let wb = props[SonyPTPPropCode.whiteBalance.rawValue]?.uint16Value.map(SonyWhiteBalance.init(wireValue:))
         let colorTemp = props[SonyPTPPropCode.colorTemperature.rawValue]?.uint16Value
         let evBias = props[SonyPTPPropCode.exposureBias.rawValue]?.int16Value.map(SonyExposureBias.init(rawMilliEV:))
@@ -1335,6 +1362,8 @@ public actor SonyPTPIPClient {
             iso: iso,
             shutterSpeed: shutter,
             aperture: aperture,
+            availableApertures: availableApertures,
+            isApertureWritable: isApertureWritable,
             whiteBalance: wb,
             colorTemperature: colorTemp,
             exposureBias: evBias,
@@ -2015,6 +2044,9 @@ private extension SonyPTPIPClient {
             let formFlag = data[data.startIndex + cursor]
             cursor += 1
 
+            var supportedList: [Data] = []
+            var settableList: [Data] = []
+
             switch formFlag {
             case 0x00:
                 // None: 无附加约束表单
@@ -2033,21 +2065,25 @@ private extension SonyPTPIPClient {
                 guard cursor + 2 <= data.count else { return result }
                 let count1 = Int(data.readUInt16LE(at: cursor))
                 cursor += 2
+                supportedList.reserveCapacity(count1)
                 for _ in 0..<count1 {
-                    guard skipPTPValue(in: data, dataType: dataType, cursor: &cursor) else {
+                    guard let valBytes = readPTPValueBytes(from: data, dataType: dataType, cursor: &cursor) else {
                         return result
                     }
+                    supportedList.append(valBytes)
                 }
 
-                // Sony SDI3 (A6700 / BIONZ XR, 0x012C) 紧跟第二张枚举表 (当前档位下可选值列表)
+                // Sony SDI3 (A6700 / BIONZ XR, 0x012C) 紧跟第二张枚举表 (当前档位/当前镜头焦段实际可选值列表)
                 if isSDI3 {
                     guard cursor + 2 <= data.count else { return result }
                     let count2 = Int(data.readUInt16LE(at: cursor))
                     cursor += 2
+                    settableList.reserveCapacity(count2)
                     for _ in 0..<count2 {
-                        guard skipPTPValue(in: data, dataType: dataType, cursor: &cursor) else {
+                        guard let valBytes = readPTPValueBytes(from: data, dataType: dataType, cursor: &cursor) else {
                             return result
                         }
+                        settableList.append(valBytes)
                     }
                 }
 
@@ -2062,7 +2098,9 @@ private extension SonyPTPIPClient {
                 getSet: getSet,
                 isEnabled: isEnable,
                 currentValueBytes: currentBytes,
-                defaultValueBytes: defaultBytes
+                defaultValueBytes: defaultBytes,
+                supportedValuesBytes: supportedList,
+                settableValuesBytes: settableList
             )
         }
 
