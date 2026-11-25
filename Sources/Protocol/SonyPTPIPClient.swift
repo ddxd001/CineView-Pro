@@ -328,16 +328,43 @@ public struct SonyShutterSpeed: Equatable, Hashable, Sendable, CustomStringConve
         (UInt32(numerator) << 16) | UInt32(denominator)
     }
 
+    /// 曝光时长（秒），用于 Range 区间过滤与排序（Bulb/Auto 返回 nil）
+    public var seconds: Double? {
+        guard self != .bulb, self != .auto, denominator > 0 else { return nil }
+        return Double(numerator) / Double(denominator)
+    }
+
     public var description: String {
         if self == .bulb { return "BULB" }
         if self == .auto { return "AUTO" }
         if denominator == 1 { return "\(numerator)\"" }
         if numerator == 1 { return "1/\(denominator)" }
         if denominator == 10 {
+            if numerator % 10 == 0 {
+                return "\(numerator / 10)\""
+            }
             return String(format: "%.1f\"", Double(numerator) / 10.0)
         }
         return "\(numerator)/\(denominator)"
     }
+
+    /// Sony Alpha 标准 1/3 档全量快门表（用于 A6700 0xD20D 返回 Range [min..max] 时按实机范围裁剪）
+    public static let sonyStandardThirdStopTable: [SonyShutterSpeed] = [
+        .fraction(1, 8000), .fraction(1, 6400), .fraction(1, 5000), .fraction(1, 4000),
+        .fraction(1, 3200), .fraction(1, 2500), .fraction(1, 2000), .fraction(1, 1600),
+        .fraction(1, 1250), .fraction(1, 1000), .fraction(1, 800), .fraction(1, 640),
+        .fraction(1, 500), .fraction(1, 400), .fraction(1, 320), .fraction(1, 250),
+        .fraction(1, 200), .fraction(1, 160), .fraction(1, 125), .fraction(1, 100),
+        .fraction(1, 80), .fraction(1, 60), .fraction(1, 50), .fraction(1, 40),
+        .fraction(1, 30), .fraction(1, 25), .fraction(1, 20), .fraction(1, 15),
+        .fraction(1, 13), .fraction(1, 10), .fraction(1, 8), .fraction(1, 6),
+        .fraction(1, 5), .fraction(1, 4), .fraction(1, 3), .fraction(4, 10),
+        .fraction(5, 10), .fraction(6, 10), .fraction(8, 10), .fraction(10, 10),
+        .fraction(13, 10), .fraction(16, 10), .fraction(20, 10), .fraction(25, 10),
+        .fraction(32, 10), .fraction(40, 10), .fraction(50, 10), .fraction(60, 10),
+        .fraction(80, 10), .fraction(100, 10), .fraction(130, 10), .fraction(150, 10),
+        .fraction(200, 10), .fraction(250, 10), .fraction(300, 10)
+    ]
 }
 
 /// 光圈值 F-Number 编码封装 (PropCode: 0x5007, UInt16 LE)
@@ -364,6 +391,13 @@ public struct SonyAperture: Equatable, Hashable, Sendable, CustomStringConvertib
         if rawValue == 0 || rawValue == 0xFFFF { return "F--" }
         return String(format: "F%.1f", fStop)
     }
+
+    /// Sony Alpha 标准 1/3 档光圈表（对照 libgphoto2 `sony_fnumbers[]`，用于 A6700 0x5007 返回 Range [min..max] 时精准裁剪当前镜头支持范围）
+    public static let sonyStandardThirdStopTable: [SonyAperture] = [
+        100, 110, 120, 140, 160, 170, 180, 200, 220, 250, 280, 320, 350,
+        400, 450, 500, 560, 630, 710, 800, 900, 1000, 1100, 1300, 1400,
+        1600, 1800, 2000, 2200, 2500, 2900, 3200, 3600, 4000, 4500, 5000, 5700, 6400
+    ].map(SonyAperture.init(rawValue:))
 }
 
 /// 白平衡模式编码封装 (PropCode: 0x5005, UInt16 LE)
@@ -646,10 +680,16 @@ public struct SonyDevicePropertyDescriptor: Sendable {
     public let getSet: UInt8
     /// Sony 私有字段: 0x00 = Disabled, 0x01 = Enabled, 0x02 = DisplayOnly
     public let isEnabled: UInt8
+    /// FormFlag: 0x00 = None, 0x01 = Range, 0x02 = Enumeration
+    public let formFlag: UInt8
     /// 当前值的原始 Little-Endian 字节
     public let currentValueBytes: Data
     /// 默认值的原始 Little-Endian 字节
     public let defaultValueBytes: Data
+    /// Range 最小值 / 最大值 / 步长 (当 formFlag == 0x01，如 A6700 的 F-Number 0x5007 & Shutter 0xD20D)
+    public let rangeMinBytes: Data?
+    public let rangeMaxBytes: Data?
+    public let rangeStepBytes: Data?
     /// Enumeration List 1：该属性支持的全部候选值 (原始 LE 字节数组)
     public let supportedValuesBytes: [Data]
     /// Enumeration List 2 (Sony SDI3 / 2023+ 机型)：当前机身档位与当前镜头焦段下「实际可设置」的候选值
@@ -670,8 +710,33 @@ public struct SonyDevicePropertyDescriptor: Sendable {
         activeEnumValuesBytes.compactMap { $0.count >= 4 ? $0.readUInt32LE(at: 0) : nil }
     }
 
+    public var rangeMinUInt16: UInt16? {
+        guard let d = rangeMinBytes, d.count >= 2 else { return nil }
+        return d.readUInt16LE(at: 0)
+    }
+
+    public var rangeMaxUInt16: UInt16? {
+        guard let d = rangeMaxBytes, d.count >= 2 else { return nil }
+        return d.readUInt16LE(at: 0)
+    }
+
+    public var rangeMinUInt32: UInt32? {
+        guard let d = rangeMinBytes, d.count >= 4 else { return nil }
+        return d.readUInt32LE(at: 0)
+    }
+
+    public var rangeMaxUInt32: UInt32? {
+        guard let d = rangeMaxBytes, d.count >= 4 else { return nil }
+        return d.readUInt32LE(at: 0)
+    }
+
     public var uint8Value: UInt8? {
         currentValueBytes.count >= 1 ? currentValueBytes[currentValueBytes.startIndex] : nil
+    }
+
+    public var int8Value: Int8? {
+        guard let u = uint8Value else { return nil }
+        return Int8(bitPattern: u)
     }
 
     public var uint16Value: UInt16? {
@@ -946,25 +1011,26 @@ private actor PTPIPTCPChannel {
     /// +-----------------------------------+-----------------------------------+
     /// ```
     /// 精确读取一个完整的 PTP/IP 协议包，支持可选超时防止 Wi-Fi 丢包死等
+    /// - 注意：绝不因外部 Task 取消而中断进行中的 TCP 读包（避免残留半包导致整条指令通道永久错位）
     func readPacket(timeout: Duration? = nil) async throws -> PTPIPRawPacket {
-        if let timeout {
-            return try await withThrowingTaskGroup(of: PTPIPRawPacket.self) { group in
-                group.addTask {
-                    try await self.readPacketUnbounded()
-                }
-                group.addTask { [name] in
-                    try await Task.sleep(for: timeout)
-                    await self.close()
-                    throw SonyPTPIPError.timeout("TCP \(name) 通道读包超时")
-                }
-                guard let result = try await group.next() else {
-                    throw SonyPTPIPError.connectionClosed
-                }
-                group.cancelAll()
-                return result
-            }
-        } else {
+        guard let timeout else {
             return try await readPacketUnbounded()
+        }
+
+        // 用独立的不可取消超时监控 Task，仅在真正超时时关闭连接释放挂起的 conn.receive
+        let timerTask = Task { [weak self] in
+            try await Task.sleep(for: timeout)
+            await self?.close()
+        }
+        defer { timerTask.cancel() }
+
+        do {
+            return try await readPacketUnbounded()
+        } catch {
+            if timerTask.isCancelled == false && isClosed {
+                throw SonyPTPIPError.timeout("TCP \(name) 通道读包超时")
+            }
+            throw error
         }
     }
 
@@ -1597,9 +1663,31 @@ public actor SonyPTPIPClient {
         let availableShutterSpeeds: [SonyShutterSpeed] = {
             guard let desc = shutterDesc else { return [] }
             var seen = Set<UInt32>()
-            return desc.uint32EnumValues
+            let enumVals = desc.uint32EnumValues
                 .filter { seen.insert($0).inserted }
                 .map(SonyShutterSpeed.init(wireValue:))
+            if !enumVals.isEmpty {
+                return enumVals
+            }
+            // A6700 实机 0xD20D 常为 FormFlag=0x01 Range [fastest..slowest]，按真实区间裁剪标准 1/3 档快门表
+            if desc.formFlag == 0x01,
+               let minWire = desc.rangeMinUInt32,
+               let maxWire = desc.rangeMaxUInt32,
+               let s1 = SonyShutterSpeed(wireValue: minWire).seconds,
+               let s2 = SonyShutterSpeed(wireValue: maxWire).seconds {
+                let lo = min(s1, s2) * 0.98
+                let hi = max(s1, s2) * 1.02
+                var list = SonyShutterSpeed.sonyStandardThirdStopTable.filter {
+                    guard let sec = $0.seconds else { return false }
+                    return sec >= lo && sec <= hi
+                }
+                if let cur = shutter, cur.seconds != nil, !list.contains(cur) {
+                    list.append(cur)
+                    list.sort { ($0.seconds ?? 0) < ($1.seconds ?? 0) }
+                }
+                return list
+            }
+            return []
         }()
         let rawShutterWritable = evaluateWritable(shutterDesc)
         let isShutterWritable: Bool? = {
@@ -1612,10 +1700,31 @@ public actor SonyPTPIPClient {
         let availableApertures: [SonyAperture] = {
             guard let desc = apertureDesc else { return [] }
             var seen = Set<UInt16>()
-            return desc.uint16EnumValues
+            let enumVals = desc.uint16EnumValues
                 .filter { $0 > 0 && $0 < 0xFFFF && seen.insert($0).inserted }
                 .sorted()
                 .map(SonyAperture.init(rawValue:))
+            if !enumVals.isEmpty {
+                return enumVals
+            }
+            // A6700 实机 0x5007 常为 FormFlag=0x01 Range [minF..maxF] (如 [280..2200] = F2.8~F22)
+            // 严格按当前镜头在当前焦段的真实最小/最大光圈裁剪标准 1/3 档光圈表，绝不显示镜头不支持的光圈值
+            if desc.formFlag == 0x01,
+               let minRaw = desc.rangeMinUInt16,
+               let maxRaw = desc.rangeMaxUInt16,
+               minRaw > 0, maxRaw >= minRaw, maxRaw < 0xFFFF {
+                var rawSet = Set<UInt16>()
+                for preset in SonyAperture.sonyStandardThirdStopTable where preset.rawValue >= minRaw && preset.rawValue <= maxRaw {
+                    rawSet.insert(preset.rawValue)
+                }
+                rawSet.insert(minRaw)
+                rawSet.insert(maxRaw)
+                if let cur = aperture, cur.rawValue >= minRaw, cur.rawValue <= maxRaw {
+                    rawSet.insert(cur.rawValue)
+                }
+                return rawSet.sorted().map(SonyAperture.init(rawValue:))
+            }
+            return []
         }()
         let rawApertureWritable = evaluateWritable(apertureDesc)
         let isApertureWritable: Bool? = {
@@ -1631,7 +1740,13 @@ public actor SonyPTPIPClient {
 
         func flagTag(_ desc: SonyDevicePropertyDescriptor?) -> String {
             guard let d = desc else { return "-" }
-            return "\(d.getSet)/\(d.isEnabled)/L2:\(d.hasSettableList ? d.settableValuesBytes.count : -1)"
+            let formTag: String
+            switch d.formFlag {
+            case 0x01: formTag = "Rng"
+            case 0x02: formTag = d.hasSettableList ? "E2:\(d.settableValuesBytes.count)" : "E1:\(d.supportedValuesBytes.count)"
+            default:   formTag = "None"
+            }
+            return "\(d.getSet)/\(d.isEnabled)/\(formTag)"
         }
         let modeLabel = exposureMode?.shortBadge ?? "-"
         let diagBase = "\(isSDI3 ? "SDI3" : "SDI2") 0x9209: \(resp.data.count)B, \(props.count)/\(parseOutcome.declaredCount)项 | 档位:\(modeLabel) | F:\(availableApertures.count)[\(flagTag(apertureDesc))] SS:\(availableShutterSpeeds.count)[\(flagTag(shutterDesc))] ISO:\(availableISOs.count)[\(flagTag(isoDesc))]"
@@ -1922,7 +2037,8 @@ public actor SonyPTPIPClient {
         }
     }
 
-    /// 在指令通道上执行一次完整的 PTP/IP 事务（受 FIFO 事务锁严格保护，杜绝 await 处 Actor 重入导致的拆包/错包死锁）
+    /// 在指令通道上执行一次完整的 PTP/IP 事务（受 FIFO 事务锁严格保护，且一旦发包即不可被外部 Task.cancel 截断，
+    /// 彻底杜绝 TCP 流半途放弃导致的事务错位与 LiveView/0x9209 串包）
     private func performTransaction(
         opCode: SonyPTPOpCode,
         dataPhase: PTPIPDataPhaseInfo,
@@ -1932,6 +2048,9 @@ public actor SonyPTPIPClient {
     ) async throws -> PTPTransactionResult {
         await acquireTransactionLock()
         defer { releaseTransactionLock() }
+
+        // 仅在尚未向 TCP 写入任何字节之前响应取消，绝不在发包后半途放弃读包！
+        try Task.checkCancellation()
 
         guard let cmdChannel = self.commandChannel else {
             throw SonyPTPIPError.notConnected
@@ -1945,130 +2064,133 @@ public actor SonyPTPIPClient {
             nextTransactionID = nextTransactionID == UInt32.max ? 1 : nextTransactionID + 1
         }
 
-        // 1. 发送 Operation_Request (0x0000_0006)
-        let reqPacket = Self.buildOperationRequestPacket(
-            dataPhase: dataPhase,
-            opCode: opCode.rawValue,
-            transactionID: txID,
-            parameters: parameters
-        )
-        try await cmdChannel.send(reqPacket)
-
-        // 2. 若为 Data-Out (主机 -> 相机)，按 CIPA 规范紧跟 Start_Data (0x0009) + End_Data (0x000C)
-        if dataPhase == .dataOut, let outboundData {
-            let startDataPacket = Self.buildStartDataPacket(
+        // 在独立不可取消子任务中完成完整的一发一收，保证锁释放时指令通道必定处于干净边界
+        let wireTask = Task<PTPTransactionResult, Error> {
+            // 1. 发送 Operation_Request (0x0000_0006)
+            let reqPacket = Self.buildOperationRequestPacket(
+                dataPhase: dataPhase,
+                opCode: opCode.rawValue,
                 transactionID: txID,
-                totalDataLength: UInt64(outboundData.count)
+                parameters: parameters
             )
-            try await cmdChannel.send(startDataPacket)
+            try await cmdChannel.send(reqPacket)
 
-            // 控制属性载荷通常为 2~8 字节，单包直接以 End_Data (0x000C) 发出；若超 64KB 自动分片
-            let chunkSize = 64 * 1024
-            if outboundData.count <= chunkSize {
-                let endPacket = Self.buildDataPacket(
-                    type: .endData,
+            // 2. 若为 Data-Out (主机 -> 相机)，按 CIPA 规范紧跟 Start_Data (0x0009) + End_Data (0x000C)
+            if dataPhase == .dataOut, let outboundData {
+                let startDataPacket = Self.buildStartDataPacket(
                     transactionID: txID,
-                    chunk: outboundData
+                    totalDataLength: UInt64(outboundData.count)
                 )
-                try await cmdChannel.send(endPacket)
-            } else {
-                var offset = 0
-                while offset < outboundData.count {
-                    let end = min(offset + chunkSize, outboundData.count)
-                    let isLast = (end == outboundData.count)
-                    let slice = outboundData.subdata(in: offset..<end)
-                    let pkt = Self.buildDataPacket(
-                        type: isLast ? .endData : .data,
+                try await cmdChannel.send(startDataPacket)
+
+                let chunkSize = 64 * 1024
+                if outboundData.count <= chunkSize {
+                    let endPacket = Self.buildDataPacket(
+                        type: .endData,
                         transactionID: txID,
-                        chunk: slice
+                        chunk: outboundData
                     )
-                    try await cmdChannel.send(pkt)
-                    offset = end
+                    try await cmdChannel.send(endPacket)
+                } else {
+                    var offset = 0
+                    while offset < outboundData.count {
+                        let end = min(offset + chunkSize, outboundData.count)
+                        let isLast = (end == outboundData.count)
+                        let slice = outboundData.subdata(in: offset..<end)
+                        let pkt = Self.buildDataPacket(
+                            type: isLast ? .endData : .data,
+                            transactionID: txID,
+                            chunk: slice
+                        )
+                        try await cmdChannel.send(pkt)
+                        offset = end
+                    }
                 }
             }
-        }
 
-        // 3. 循环接收响应流：可能先收到 Start_Data (0x0009) + 若干 Data (0x000A) + End_Data (0x000C)，
-        //    最终以 Operation_Response (0x0007) 结束本次事务。
-        var inboundData = Data()
-        var expectedInboundLength: UInt64?
+            // 3. 循环接收响应流，严格校验 TransactionID 一致性，自动忽略偶发迟到的旧事务残留包
+            var inboundData = Data()
+            var expectedInboundLength: UInt64?
 
-        while true {
-            let packet = try await cmdChannel.readPacket(timeout: .seconds(5))
+            while true {
+                let packet = try await cmdChannel.readPacket(timeout: .seconds(5))
 
-            switch packet.packetType {
-            case .startData:
-                // Start_Data (0x0000_0009) 载荷 (12 字节):
-                // [0x00...0x03] TransactionID   (UInt32 LE)
-                // [0x04...0x0B] TotalDataLength (UInt64 LE)
-                guard packet.payload.count >= 12 else {
-                    throw SonyPTPIPError.malformedPacket("Start_Data 载荷不足 12 字节")
-                }
-                let totalLen = packet.payload.readUInt64LE(at: 4)
-                expectedInboundLength = totalLen
-                if totalLen > 0 && totalLen <= 16 * 1024 * 1024 {
-                    inboundData.reserveCapacity(Int(totalLen))
-                }
+                switch packet.packetType {
+                case .startData:
+                    guard packet.payload.count >= 12 else {
+                        throw SonyPTPIPError.malformedPacket("Start_Data 载荷不足 12 字节")
+                    }
+                    let pktTxID = packet.payload.readUInt32LE(at: 0)
+                    guard pktTxID == txID else { continue }
+                    let totalLen = packet.payload.readUInt64LE(at: 4)
+                    expectedInboundLength = totalLen
+                    inboundData.removeAll(keepingCapacity: true)
+                    if totalLen > 0 && totalLen <= 16 * 1024 * 1024 {
+                        inboundData.reserveCapacity(Int(totalLen))
+                    }
 
-            case .data:
-                // Data (0x0000_000A) 载荷:
-                // [0x00...0x03] TransactionID (UInt32 LE)
-                // [0x04...]     Data Chunk
-                guard packet.payload.count >= 4 else {
-                    throw SonyPTPIPError.malformedPacket("Data 包载荷不足 4 字节")
-                }
-                inboundData.append(packet.payload.dropFirst(4))
-
-            case .endData:
-                // End_Data (0x0000_000C) 载荷:
-                // [0x00...0x03] TransactionID (UInt32 LE)
-                // [0x04...]     Final Data Chunk (可能为空，仅做结束标志)
-                guard packet.payload.count >= 4 else {
-                    throw SonyPTPIPError.malformedPacket("End_Data 包载荷不足 4 字节")
-                }
-                if packet.payload.count > 4 {
+                case .data:
+                    guard packet.payload.count >= 4 else {
+                        throw SonyPTPIPError.malformedPacket("Data 包载荷不足 4 字节")
+                    }
+                    let pktTxID = packet.payload.readUInt32LE(at: 0)
+                    guard pktTxID == txID else { continue }
                     inboundData.append(packet.payload.dropFirst(4))
-                }
-                if let expected = expectedInboundLength, UInt64(inboundData.count) != expected {
-                    logger.debug("Data-In 长度差异: 声明 \(expected) B，实收 \(inboundData.count) B")
-                }
 
-            case .operationResponse:
-                // Operation_Response (0x0000_0007) 载荷 (至少 6 字节):
-                // [0x00...0x01] ResponseCode  (UInt16 LE, 如 0x2001 = OK)
-                // [0x02...0x05] TransactionID (UInt32 LE)
-                // [0x06...]     Parameters    (0~5 个 UInt32 LE)
-                guard packet.payload.count >= 6 else {
-                    throw SonyPTPIPError.malformedPacket("Operation_Response 载荷不足 6 字节")
-                }
-                let responseCode = packet.payload.readUInt16LE(at: 0)
-                let respTxID = packet.payload.readUInt32LE(at: 2)
-                var respParams: [UInt32] = []
-                var offset = 6
-                while offset + 4 <= packet.payload.count {
-                    respParams.append(packet.payload.readUInt32LE(at: offset))
-                    offset += 4
-                }
-                return PTPTransactionResult(
-                    responseCode: responseCode,
-                    transactionID: respTxID,
-                    parameters: respParams,
-                    data: inboundData
-                )
+                case .endData:
+                    guard packet.payload.count >= 4 else {
+                        throw SonyPTPIPError.malformedPacket("End_Data 包载荷不足 4 字节")
+                    }
+                    let pktTxID = packet.payload.readUInt32LE(at: 0)
+                    guard pktTxID == txID else { continue }
+                    if packet.payload.count > 4 {
+                        inboundData.append(packet.payload.dropFirst(4))
+                    }
+                    if let expected = expectedInboundLength, UInt64(inboundData.count) != expected {
+                        self.logger.debug("Data-In 长度差异: 声明 \(expected) B，实收 \(inboundData.count) B")
+                    }
 
-            case .cancel:
-                throw SonyPTPIPError.ptpOperationFailed(
-                    opCode: opCode.rawValue,
-                    responseCode: PTPResponseCode.transactionCancelled.rawValue
-                )
+                case .operationResponse:
+                    guard packet.payload.count >= 6 else {
+                        throw SonyPTPIPError.malformedPacket("Operation_Response 载荷不足 6 字节")
+                    }
+                    let responseCode = packet.payload.readUInt16LE(at: 0)
+                    let respTxID = packet.payload.readUInt32LE(at: 2)
+                    // 若收到旧事务迟到的 Response，丢弃继续等待本事务 (txID) 的真正 Response
+                    guard respTxID == txID else {
+                        inboundData.removeAll(keepingCapacity: true)
+                        expectedInboundLength = nil
+                        continue
+                    }
+                    var respParams: [UInt32] = []
+                    var offset = 6
+                    while offset + 4 <= packet.payload.count {
+                        respParams.append(packet.payload.readUInt32LE(at: offset))
+                        offset += 4
+                    }
+                    return PTPTransactionResult(
+                        responseCode: responseCode,
+                        transactionID: respTxID,
+                        parameters: respParams,
+                        data: inboundData
+                    )
 
-            default:
-                throw SonyPTPIPError.unexpectedPacketType(
-                    expected: PTPIPPacketType.operationResponse.rawValue,
-                    actual: packet.typeRawValue
-                )
+                case .cancel:
+                    throw SonyPTPIPError.ptpOperationFailed(
+                        opCode: opCode.rawValue,
+                        responseCode: PTPResponseCode.transactionCancelled.rawValue
+                    )
+
+                default:
+                    throw SonyPTPIPError.unexpectedPacketType(
+                        expected: PTPIPPacketType.operationResponse.rawValue,
+                        actual: packet.typeRawValue
+                    )
+                }
             }
         }
+
+        return try await wireTask.value
     }
 }
 
@@ -2366,8 +2488,12 @@ private extension SonyPTPIPClient {
                     dataType: dataType,
                     getSet: getSet,
                     isEnabled: isEnable,
+                    formFlag: 0x00,
                     currentValueBytes: currentBytes,
                     defaultValueBytes: defaultBytes,
+                    rangeMinBytes: nil,
+                    rangeMaxBytes: nil,
+                    rangeStepBytes: nil,
                     supportedValuesBytes: [],
                     settableValuesBytes: [],
                     hasSettableList: false
@@ -2377,6 +2503,9 @@ private extension SonyPTPIPClient {
             let formFlag = data[data.startIndex + cursor]
             cursor += 1
 
+            var rangeMinBytes: Data?
+            var rangeMaxBytes: Data?
+            var rangeStepBytes: Data?
             var supportedList: [Data] = []
             var settableList: [Data] = []
             var hasSettableList = false
@@ -2387,13 +2516,16 @@ private extension SonyPTPIPClient {
                 break
 
             case 0x01:
-                // Range: Min, Max, Step (共 3 个同类型值)
-                guard skipPTPValue(in: data, dataType: dataType, cursor: &cursor),
-                      skipPTPValue(in: data, dataType: dataType, cursor: &cursor),
-                      skipPTPValue(in: data, dataType: dataType, cursor: &cursor) else {
+                // Range: Min, Max, Step (共 3 个同类型值 — A6700 的 F-Number 0x5007 与 Shutter 0xD20D 均使用 Range!)
+                guard let rMin = readPTPValueBytes(from: data, dataType: dataType, cursor: &cursor),
+                      let rMax = readPTPValueBytes(from: data, dataType: dataType, cursor: &cursor),
+                      let rStep = readPTPValueBytes(from: data, dataType: dataType, cursor: &cursor) else {
                     stopReason = String(format: "rng#\(idx)@\(entryStart) 0x%04X dt=0x%04X", propCode, dataType)
                     return ExtPropParseOutcome(properties: result, declaredCount: totalCount, stopReason: stopReason)
                 }
+                rangeMinBytes = rMin
+                rangeMaxBytes = rMax
+                rangeStepBytes = rStep
 
             case 0x02:
                 // Enumeration List 1 (全部支持值): UInt16 Count + N × Value
@@ -2443,8 +2575,12 @@ private extension SonyPTPIPClient {
                 dataType: dataType,
                 getSet: getSet,
                 isEnabled: isEnable,
+                formFlag: formFlag,
                 currentValueBytes: currentBytes,
                 defaultValueBytes: defaultBytes,
+                rangeMinBytes: rangeMinBytes,
+                rangeMaxBytes: rangeMaxBytes,
+                rangeStepBytes: rangeStepBytes,
                 supportedValuesBytes: supportedList,
                 settableValuesBytes: settableList,
                 hasSettableList: hasSettableList

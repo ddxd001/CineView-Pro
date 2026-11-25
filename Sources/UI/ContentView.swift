@@ -584,13 +584,21 @@ public final class MonitorViewModel {
     private func scheduleDebouncedStateSync(delayMs: Int) {
         eventDebounceTask?.cancel()
         eventDebounceTask = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(delayMs))
-            guard !Task.isCancelled, let self, let activeClient = self.ptpClient else { return }
             do {
-                let snap = try await activeClient.fetchCameraState()
-                self.applySnapshot(snap)
+                try await Task.sleep(for: .milliseconds(delayMs))
             } catch {
-                self.ptpDiagnosticText = "0x9209 事件同步异常: \(error.localizedDescription)"
+                return // 仅在防抖等待阶段响应取消，进入网络拉取后不再被取消打断
+            }
+            guard let self, let activeClient = self.ptpClient else { return }
+            // 在独立任务中拉取快照，确保后续新事件只重置防抖计时器而绝不中断正在进行的 0x9209
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                do {
+                    let snap = try await activeClient.fetchCameraState()
+                    self.applySnapshot(snap)
+                } catch {
+                    self.ptpDiagnosticText = "0x9209 事件同步异常: \(error.localizedDescription)"
+                }
             }
         }
     }
@@ -643,8 +651,10 @@ public final class MonitorViewModel {
         if let k = snap.colorTemperature, k >= 2500, k <= 9900 { currentColorTemp = k }
         if let ev = snap.exposureBias { currentExposureBias = ev }
 
-        // 解析标准 PTP BatteryLevel (0x5001, UInt8 0...100)
-        if let bat = snap.rawProperties[0x5001]?.uint8Value {
+        // 优先解析 Sony 私有 BatteryLevel (0xD218, Int8 -1...100)，回退至标准 PTP 0x5001 (UInt8 0...100)
+        if let sonyBat = snap.rawProperties[0xD218]?.int8Value, sonyBat >= 0 {
+            batteryPercent = min(100, Int(sonyBat))
+        } else if let bat = snap.rawProperties[0x5001]?.uint8Value {
             batteryPercent = min(100, Int(bat))
         }
 
