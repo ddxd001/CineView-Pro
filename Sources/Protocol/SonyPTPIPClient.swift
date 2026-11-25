@@ -2600,8 +2600,20 @@ private extension SonyPTPIPClient {
 
     /// 根据 PTP DataType 跳过单个值（定长标量、数组或 PTP Unicode 字符串）
     private static func skipPTPValue(in data: Data, dataType: UInt16, cursor: inout Int) -> Bool {
-        // 1. PTP 数组类型 (高 4 位 0x4000): UInt32 元素个数 + N × 标量宽度
-        if (dataType & 0x4000) != 0 {
+        // 1. PTP Unicode 字符串 (0xFFFF): 必须最先判断！因为 0xFFFF 的 bit14 也为 1，绝不可被 0x4000 数组分支误截
+        //    结构：UInt8 字符数(含末尾 0x0000) + charCount × 2 字节 UTF-16LE
+        if dataType == PTPDataType.string.rawValue {
+            guard cursor < data.count else { return false }
+            let charCount = Int(data[data.startIndex + cursor])
+            cursor += 1
+            let byteLen = charCount * 2
+            guard cursor + byteLen <= data.count else { return false }
+            cursor += byteLen
+            return true
+        }
+
+        // 2. PTP 数组类型 (高 4 位严格为 0x4000，如 0x4001...0x400A): UInt32 元素个数 + N × 标量宽度
+        if (dataType & 0xF000) == 0x4000 {
             guard cursor + 4 <= data.count else { return false }
             let elementCount = Int(data.readUInt32LE(at: cursor))
             cursor += 4
@@ -2610,17 +2622,6 @@ private extension SonyPTPIPClient {
             let totalBytes = elementCount * elemSize
             guard elementCount >= 0, cursor + totalBytes <= data.count else { return false }
             cursor += totalBytes
-            return true
-        }
-
-        // 2. PTP Unicode 字符串 (0xFFFF): UInt8 字符数(含末尾 0x0000) + charCount × 2 字节 UTF-16LE
-        if dataType == PTPDataType.string.rawValue {
-            guard cursor < data.count else { return false }
-            let charCount = Int(data[data.startIndex + cursor])
-            cursor += 1
-            let byteLen = charCount * 2
-            guard cursor + byteLen <= data.count else { return false }
-            cursor += byteLen
             return true
         }
 
