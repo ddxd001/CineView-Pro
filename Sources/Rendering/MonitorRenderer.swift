@@ -104,7 +104,11 @@ public struct MonitorRenderSettings: Equatable, Sendable {
     public var zebraThresholdIRE: Float = 95.0
     /// 变形镜头反挤压倍率
     public var desqueeze: AnamorphicDesqueeze = .off
-    /// 是否开启计算着色器实时计算波形图与 RGB 直方图
+    /// 水平镜像翻转 (自拍 / 提词器场景)
+    public var flipHorizontal: Bool = false
+    /// 垂直上下翻转 (倒装兔笼场景)
+    public var flipVertical: Bool = false
+    /// 是否开启计算着色器实时计算示波器
     public var isScopesEnabled: Bool = true
     /// 示波器计算是否基于 LUT 还原后的色彩 (false = 监控原始 Log 曝光, true = 监控还原后 Rec.709)
     public var scopesApplyLUT: Bool = true
@@ -112,7 +116,7 @@ public struct MonitorRenderSettings: Equatable, Sendable {
     public init() {}
 }
 
-/// 计算着色器输出的单帧示波器统计结果 (可直接用于 SwiftUI Canvas 或 CoreGraphics 绘制)
+/// 计算着色器输出的单帧全套示波器统计结果 (波形图 / RGB 分量波形 / 矢量示波器 / RGB 直方图)
 public struct ScopeAnalysisResult: Sendable {
     /// 256 档归一化 Red 直方图 [0.0, 1.0]
     public let redHistogram: [Float]
@@ -126,9 +130,16 @@ public struct ScopeAnalysisResult: Sendable {
     public let waveformWidth: Int
     /// 亮度波形图垂直 IRE 级数 (默认 128, index 0 = 0 IRE 底部, height-1 = 100 IRE 顶部)
     public let waveformHeight: Int
-    /// 行主序归一化波形密度矩阵 (`waveformHeight * waveformWidth`, 范围 [0.0, 1.0])
-    /// 取点方式：`waveformIntensities[ireRow * waveformWidth + column]`
+    /// 行主序归一化亮度波形密度矩阵 (`waveformHeight * waveformWidth`, 范围 [0.0, 1.0])
     public let waveformIntensities: [Float]
+    /// RGB 分量波形单通道边长 (默认 128: 每通道 128×128)
+    public let paradeSize: Int
+    public let redParade: [Float]
+    public let greenParade: [Float]
+    public let blueParade: [Float]
+    /// 矢量示波器边长 (默认 128: X=Cb ∈ [-0.5, +0.5], Y=Cr ∈ [-0.5, +0.5])
+    public let vectorscopeSize: Int
+    public let vectorscopeIntensities: [Float]
     /// 统计完成时间戳
     public let timestamp: ContinuousClock.Instant
 }
@@ -354,6 +365,12 @@ struct MonitorUniforms {
     var waveformWidth: UInt32 = 256
     var waveformHeight: UInt32 = 128
     var sampleStride: UInt32 = 2
+
+    // Block 7 (112...127)
+    var flipHorizontal: UInt32 = 0
+    var flipVertical: UInt32 = 0
+    var paradeSize: UInt32 = 128
+    var vectorscopeSize: UInt32 = 128
 }
 
 // MARK: - 4. 线程安全跨队列帧递交箱
@@ -381,31 +398,67 @@ private enum PendingVideoFrame: Sendable {
 
 /// 三缓冲 Compute Scope 槽位，避免 waitUntilCompleted 阻塞 60fps 渲染
 private final class ScopeBufferSlot: @unchecked Sendable {
-    let histogramBuffer: MTLBuffer // 4 * 256 * UInt32 = 4096 bytes
-    let waveformBuffer: MTLBuffer  // waveformWidth * waveformHeight * UInt32
+    let histogramBuffer: MTLBuffer   // 4 * 256 * UInt32
+    let waveformBuffer: MTLBuffer    // waveformWidth * waveformHeight * UInt32
+    let paradeBuffer: MTLBuffer      // 3 * paradeSize * paradeSize * UInt32
+    let vectorscopeBuffer: MTLBuffer // vectorscopeSize * vectorscopeSize * UInt32
     let waveformWidth: Int
     let waveformHeight: Int
+    let paradeSize: Int
+    let vectorscopeSize: Int
 
-    init?(device: MTLDevice, waveformWidth: Int, waveformHeight: Int) {
+    init?(device: MTLDevice, waveformWidth: Int, waveformHeight: Int, paradeSize: Int, vectorscopeSize: Int) {
         self.waveformWidth = waveformWidth
         self.waveformHeight = waveformHeight
+        self.paradeSize = paradeSize
+        self.vectorscopeSize = vectorscopeSize
+
         let histSize = 4 * 256 * MemoryLayout<UInt32>.stride
         let waveSize = waveformWidth * waveformHeight * MemoryLayout<UInt32>.stride
+        let parSize = 3 * paradeSize * paradeSize * MemoryLayout<UInt32>.stride
+        let vecSize = vectorscopeSize * vectorscopeSize * MemoryLayout<UInt32>.stride
+
         guard let hBuf = device.makeBuffer(length: histSize, options: .storageModeShared),
-              let wBuf = device.makeBuffer(length: waveSize, options: .storageModeShared) else {
+              let wBuf = device.makeBuffer(length: waveSize, options: .storageModeShared),
+              let pBuf = device.makeBuffer(length: parSize, options: .storageModeShared),
+              let vBuf = device.makeBuffer(length: vecSize, options: .storageModeShared) else {
             return nil
         }
         self.histogramBuffer = hBuf
         self.waveformBuffer = wBuf
+        self.paradeBuffer = pBuf
+        self.vectorscopeBuffer = vBuf
     }
 
-    /// 在 GPU CommandBuffer 完成后于后台线程提取并归一化直方图与波形图数据
+    private static func normalizeLog1p(_ ptr: UnsafePointer<UInt32>, count: Int) -> [Float] {
+        var maxVal: UInt32 = 1
+        for i in 0..<count {
+            let v = ptr[i]
+            if v > maxVal { maxVal = v }
+        }
+        let denom = log1p(Float(maxVal))
+        let inv = denom > 0 ? (1.0 / denom) : 0.0
+        var out = [Float](repeating: 0, count: count)
+        for i in 0..<count {
+            let v = ptr[i]
+            if v > 0 {
+                out[i] = min(1.0, log1p(Float(v)) * inv)
+            }
+        }
+        return out
+    }
+
+    /// 在 GPU CommandBuffer 完成后于后台线程提取并归一化 4 套示波器数据
     func extractNormalizedResult() -> ScopeAnalysisResult {
         let histPtr = histogramBuffer.contents().bindMemory(to: UInt32.self, capacity: 1024)
         let waveCount = waveformWidth * waveformHeight
         let wavePtr = waveformBuffer.contents().bindMemory(to: UInt32.self, capacity: waveCount)
+        let paradePlane = paradeSize * paradeSize
+        let paradePtr = paradeBuffer.contents().bindMemory(to: UInt32.self, capacity: 3 * paradePlane)
+        let vecCount = vectorscopeSize * vectorscopeSize
+        let vecPtr = vectorscopeBuffer.contents().bindMemory(to: UInt32.self, capacity: vecCount)
 
-        // 1. 归一化 RGB + Luma 直方图 (排除 0/255 极端单点裁切尖峰干扰，取第 1...254 或整体最大值做平滑归一化)
+        // 1. 归一化 RGB + Luma 直方图
         var maxHist: UInt32 = 1
         for i in 0..<1024 {
             let v = histPtr[i]
@@ -425,22 +478,12 @@ private final class ScopeBufferSlot: @unchecked Sendable {
             luma[i]  = Float(histPtr[768 + i]) * invMaxHist
         }
 
-        // 2. 归一化亮度波形图 (采用 log1p 对数增益，还原专业硬件示波器的辉度层次感)
-        var maxWave: UInt32 = 1
-        for i in 0..<waveCount {
-            let v = wavePtr[i]
-            if v > maxWave { maxWave = v }
-        }
-        let logDenom = log1p(Float(maxWave))
-        let invLogDenom = logDenom > 0 ? (1.0 / logDenom) : 0.0
-
-        var waveform = [Float](repeating: 0, count: waveCount)
-        for i in 0..<waveCount {
-            let v = wavePtr[i]
-            if v > 0 {
-                waveform[i] = min(1.0, log1p(Float(v)) * invLogDenom)
-            }
-        }
+        // 2. 归一化亮度波形、RGB 分量波形与矢量示波器 (采用 log1p 模拟专业示波器荧光辉度)
+        let waveform = Self.normalizeLog1p(wavePtr, count: waveCount)
+        let redParade = Self.normalizeLog1p(paradePtr, count: paradePlane)
+        let greenParade = Self.normalizeLog1p(paradePtr.advanced(by: paradePlane), count: paradePlane)
+        let blueParade = Self.normalizeLog1p(paradePtr.advanced(by: 2 * paradePlane), count: paradePlane)
+        let vectorscope = Self.normalizeLog1p(vecPtr, count: vecCount)
 
         return ScopeAnalysisResult(
             redHistogram: red,
@@ -450,6 +493,12 @@ private final class ScopeBufferSlot: @unchecked Sendable {
             waveformWidth: waveformWidth,
             waveformHeight: waveformHeight,
             waveformIntensities: waveform,
+            paradeSize: paradeSize,
+            redParade: redParade,
+            greenParade: greenParade,
+            blueParade: blueParade,
+            vectorscopeSize: vectorscopeSize,
+            vectorscopeIntensities: vectorscope,
             timestamp: .now
         )
     }
@@ -512,6 +561,8 @@ public final class MonitorRenderer: NSObject, MTKViewDelegate {
     private var currentSlotIndex = 0
     private let waveformWidth = 256
     private let waveformHeight = 128
+    private let paradeSize = 128
+    private let vectorscopeSize = 128
 
     // --- 跨线程帧递交锁 (允许 AVFoundation 采集线程 / PTP 后台任务无锁阻塞写入) ---
     private let pendingFrameLock = OSAllocatedUnfairLock<PendingVideoFrame?>(initialState: nil)
@@ -597,7 +648,13 @@ public final class MonitorRenderer: NSObject, MTKViewDelegate {
         var slots: [ScopeBufferSlot] = []
         slots.reserveCapacity(Self.maxFramesInFlight)
         for _ in 0..<Self.maxFramesInFlight {
-            guard let slot = ScopeBufferSlot(device: metalDevice, waveformWidth: 256, waveformHeight: 128) else {
+            guard let slot = ScopeBufferSlot(
+                device: metalDevice,
+                waveformWidth: 256,
+                waveformHeight: 128,
+                paradeSize: 128,
+                vectorscopeSize: 128
+            ) else {
                 throw MonitorRendererError.lutTextureAllocationFailed
             }
             slots.append(slot)
@@ -788,33 +845,42 @@ public final class MonitorRenderer: NSObject, MTKViewDelegate {
             scopesApplyLUT: (settings.scopesApplyLUT && settings.isLUTEnabled && activeLUTTexture != nil) ? 1 : 0,
             waveformWidth: UInt32(waveformWidth),
             waveformHeight: UInt32(waveformHeight),
-            sampleStride: adaptiveStride
+            sampleStride: adaptiveStride,
+            flipHorizontal: settings.flipHorizontal ? 1 : 0,
+            flipVertical: settings.flipVertical ? 1 : 0,
+            paradeSize: UInt32(paradeSize),
+            vectorscopeSize: UInt32(vectorscopeSize)
         )
 
         let chromaTexture = activeChromaTexture ?? dummy2DTexture
         let lutTexture = activeLUTTexture ?? dummy3DLUTTexture
 
-        // 3. Compute Pass：并行计算亮度波形图 (Waveform) 与 RGB+Luma 直方图
+        // 3. Compute Pass：单次并行计算亮度波形图、RGB 分量波形、矢量示波器与 RGB+Luma 直方图
         let shouldRunScopes = settings.isScopesEnabled && hasNewFrameForScopes
         if shouldRunScopes {
             hasNewFrameForScopes = false
             if let computeEncoder = commandBuffer.makeComputeCommandEncoder() {
                 computeEncoder.label = "CineViewPro.ScopesComputePass"
 
-                // 3a. 清零缓冲
+                // 3a. 清零 4 组示波器缓冲
                 computeEncoder.setComputePipelineState(clearScopesPipeline)
                 computeEncoder.setBuffer(slot.histogramBuffer, offset: 0, index: 0)
                 computeEncoder.setBuffer(slot.waveformBuffer, offset: 0, index: 1)
                 computeEncoder.setBytes(&uniforms, length: MemoryLayout<MonitorUniforms>.stride, index: 2)
+                computeEncoder.setBuffer(slot.paradeBuffer, offset: 0, index: 3)
+                computeEncoder.setBuffer(slot.vectorscopeBuffer, offset: 0, index: 4)
 
-                let clearTotal = max(4 * 256, waveformWidth * waveformHeight)
+                let clearTotal = max(
+                    max(4 * 256, waveformWidth * waveformHeight),
+                    max(3 * paradeSize * paradeSize, vectorscopeSize * vectorscopeSize)
+                )
                 let clearTGWidth = min(clearScopesPipeline.maxTotalThreadsPerThreadgroup, 256)
                 computeEncoder.dispatchThreads(
                     MTLSize(width: clearTotal, height: 1, depth: 1),
                     threadsPerThreadgroup: MTLSize(width: clearTGWidth, height: 1, depth: 1)
                 )
 
-                // 3b. 并行统计波形图 + RGB 直方图
+                // 3b. 单遍并行统计 4 套专业示波器
                 computeEncoder.setComputePipelineState(analyzeScopesPipeline)
                 computeEncoder.setTexture(primaryTexture, index: 0)
                 computeEncoder.setTexture(chromaTexture, index: 1)
@@ -822,6 +888,8 @@ public final class MonitorRenderer: NSObject, MTKViewDelegate {
                 computeEncoder.setBuffer(slot.histogramBuffer, offset: 0, index: 0)
                 computeEncoder.setBuffer(slot.waveformBuffer, offset: 0, index: 1)
                 computeEncoder.setBytes(&uniforms, length: MemoryLayout<MonitorUniforms>.stride, index: 2)
+                computeEncoder.setBuffer(slot.paradeBuffer, offset: 0, index: 3)
+                computeEncoder.setBuffer(slot.vectorscopeBuffer, offset: 0, index: 4)
 
                 let sampleGridW = max(1, (Int(activeSourceSize.x) + Int(adaptiveStride) - 1) / Int(adaptiveStride))
                 let sampleGridH = max(1, (Int(activeSourceSize.y) + Int(adaptiveStride) - 1) / Int(adaptiveStride))
@@ -1147,5 +1215,100 @@ public enum ExternalUVCCaptureDiscovery {
         [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
         ]
+    }
+}
+
+// MARK: - 7. 多 .cube 3D LUT 本地收藏夹管理器 (持久化到 Documents/CineViewLUTs)
+
+/// 保存在本地收藏夹中的 3D LUT 条目
+public struct SavedLUTItem: Identifiable, Equatable, Hashable, Sendable {
+    public let id: String          // 文件名（唯一键）
+    public let displayName: String // 显示名称（不含 .cube 后缀）
+    public let fileURL: URL
+}
+
+/// 负责将用户导入的 `.cube` 文件持久化复制到 App 沙盒 `Documents/CineViewLUTs/`，支持多 LUT 快速切换与删除
+public enum LUTLibraryManager {
+    private static let folderName = "CineViewLUTs"
+    private static let lastSelectedKey = "com.cineviewpro.lut.lastSelectedID"
+
+    public static var libraryDirectoryURL: URL {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        let dir = docs.appendingPathComponent(folderName, isDirectory: true)
+        if !FileManager.default.fileExists(atPath: dir.path) {
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+        return dir
+    }
+
+    /// 列出本地收藏夹中所有已保存的 `.cube` 文件（按名称排序）
+    public static func listSavedLUTs() -> [SavedLUTItem] {
+        let dir = libraryDirectoryURL
+        guard let urls = try? FileManager.default.contentsOfDirectory(
+            at: dir,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else {
+            return []
+        }
+
+        return urls
+            .filter { $0.pathExtension.lowercased() == "cube" }
+            .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+            .map { url in
+                SavedLUTItem(
+                    id: url.lastPathComponent,
+                    displayName: url.deletingPathExtension().lastPathComponent,
+                    fileURL: url
+                )
+            }
+    }
+
+    /// 导入外部 `.cube` 文件：先校验格式合法性，再拷贝至本地收藏夹目录持久化
+    public static func importLUT(from sourceURL: URL) throws -> SavedLUTItem {
+        // 先解析校验，防止把损坏文件写入收藏夹
+        _ = try CubeLUT.parse(contentsOf: sourceURL)
+
+        let dir = libraryDirectoryURL
+        var fileName = sourceURL.lastPathComponent
+        if !fileName.lowercased().hasSuffix(".cube") {
+            fileName += ".cube"
+        }
+        let destURL = dir.appendingPathComponent(fileName)
+        if FileManager.default.fileExists(atPath: destURL.path) {
+            try FileManager.default.removeItem(at: destURL)
+        }
+        try FileManager.default.copyItem(at: sourceURL, to: destURL)
+
+        let item = SavedLUTItem(
+            id: destURL.lastPathComponent,
+            displayName: destURL.deletingPathExtension().lastPathComponent,
+            fileURL: destURL
+        )
+        setLastSelectedLUTID(item.id)
+        return item
+    }
+
+    /// 删除指定收藏夹 LUT
+    public static func deleteLUT(_ item: SavedLUTItem) throws {
+        if FileManager.default.fileExists(atPath: item.fileURL.path) {
+            try FileManager.default.removeItem(at: item.fileURL)
+        }
+        if lastSelectedLUTID == item.id {
+            setLastSelectedLUTID(nil)
+        }
+    }
+
+    public static var lastSelectedLUTID: String? {
+        UserDefaults.standard.string(forKey: lastSelectedKey)
+    }
+
+    public static func setLastSelectedLUTID(_ id: String?) {
+        if let id {
+            UserDefaults.standard.set(id, forKey: lastSelectedKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: lastSelectedKey)
+        }
     }
 }

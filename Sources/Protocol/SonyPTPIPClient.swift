@@ -112,10 +112,14 @@ public enum SonyPTPPropCode: UInt16, Sendable {
     case whiteBalance      = 0x5005
     /// 光圈值 F-Number (UInt16，实际值 × 100，例如 f/2.8 -> 280 = 0x0118)
     case fNumber           = 0x5007
+    /// 曝光补偿 Exposure Bias Compensation (Int16，单位 1/1000 EV，如 -1000 = -1.0 EV, +300 = +0.3 EV)
+    case exposureBias      = 0x5010
 
     // --- Sony 私有属性码 (0xD2xx) ---
     /// 快门速度 (UInt32: 高 16 位为分子，低 16 位为分母，如 1/125s -> 0x0001_007D)
     case shutterSpeed      = 0xD20D
+    /// 精准色温值 Color Temperature (UInt16: 开尔文 K，2500...9900 步进 100K，如 5600K = 0x15E0)
+    case colorTemperature  = 0xD20F
     /// 录制状态只读属性 (UInt16: 0x0000 = 未录制, 0x0001 = 录制中)
     case recordingState    = 0xD21D
     /// ISO 感光度 (UInt32: 0x00FF_FFFF = Auto; 低 24 位为数值如 800 = 0x0000_0320)
@@ -443,6 +447,32 @@ public enum SonyWhiteBalance: Equatable, Hashable, Sendable, CustomStringConvert
     }
 }
 
+/// 曝光补偿编码封装 (PropCode: 0x5010, Int16 LE，单位 1/1000 EV)
+/// - Sony 标准 1/3 档步进示例：`-2000` (-2.0), `-1700` (-1.7), `-300` (-0.3), `0` (±0.0), `+300` (+0.3), `+1000` (+1.0)
+public struct SonyExposureBias: Equatable, Hashable, Sendable, CustomStringConvertible {
+    public let rawMilliEV: Int16
+
+    public init(rawMilliEV: Int16) {
+        self.rawMilliEV = rawMilliEV
+    }
+
+    public var ev: Double {
+        Double(rawMilliEV) / 1000.0
+    }
+
+    public var description: String {
+        if rawMilliEV == 0 { return "±0.0" }
+        return String(format: "%+.1f", ev)
+    }
+
+    /// Sony A6700 标准 1/3 档曝光补偿表 (-3.0 EV ... +3.0 EV)
+    public static let standardThirdStopPresets: [SonyExposureBias] = [
+        -3000, -2700, -2300, -2000, -1700, -1300, -1000, -700, -300,
+        0,
+        300, 700, 1000, 1300, 1700, 2000, 2300, 2700, 3000
+    ].map(SonyExposureBias.init(rawMilliEV:))
+}
+
 /// 触控对焦归一化坐标 (0.0...1.0) -> 映射为 Sony LiveView 640×480 坐标系
 public struct TouchFocusPoint: Equatable, Sendable {
     /// 归一化水平坐标，0.0 = 最左，1.0 = 最右
@@ -487,6 +517,11 @@ public struct SonyDevicePropertyDescriptor: Sendable {
         return currentValueBytes.readUInt16LE(at: 0)
     }
 
+    public var int16Value: Int16? {
+        guard let u = uint16Value else { return nil }
+        return Int16(bitPattern: u)
+    }
+
     public var uint32Value: UInt32? {
         guard currentValueBytes.count >= 4 else { return nil }
         return currentValueBytes.readUInt32LE(at: 0)
@@ -499,6 +534,8 @@ public struct CameraStateSnapshot: Sendable {
     public let shutterSpeed: SonyShutterSpeed?
     public let aperture: SonyAperture?
     public let whiteBalance: SonyWhiteBalance?
+    public let colorTemperature: UInt16?
+    public let exposureBias: SonyExposureBias?
     public let isRecording: Bool
     public let isLiveViewEnabled: Bool
     public let rawProperties: [UInt16: SonyDevicePropertyDescriptor]
@@ -1289,6 +1326,8 @@ public actor SonyPTPIPClient {
         let shutter = props[SonyPTPPropCode.shutterSpeed.rawValue]?.uint32Value.map(SonyShutterSpeed.init(wireValue:))
         let aperture = props[SonyPTPPropCode.fNumber.rawValue]?.uint16Value.map(SonyAperture.init(rawValue:))
         let wb = props[SonyPTPPropCode.whiteBalance.rawValue]?.uint16Value.map(SonyWhiteBalance.init(wireValue:))
+        let colorTemp = props[SonyPTPPropCode.colorTemperature.rawValue]?.uint16Value
+        let evBias = props[SonyPTPPropCode.exposureBias.rawValue]?.int16Value.map(SonyExposureBias.init(rawMilliEV:))
         let isRecording = (props[SonyPTPPropCode.recordingState.rawValue]?.uint16Value ?? 0) != 0
         let isLiveViewEnabled = (props[SonyPTPPropCode.liveViewStatus.rawValue]?.uint8Value ?? 0) != 0
 
@@ -1297,6 +1336,8 @@ public actor SonyPTPIPClient {
             shutterSpeed: shutter,
             aperture: aperture,
             whiteBalance: wb,
+            colorTemperature: colorTemp,
+            exposureBias: evBias,
             isRecording: isRecording,
             isLiveViewEnabled: isLiveViewEnabled,
             rawProperties: props
@@ -1373,6 +1414,47 @@ public actor SonyPTPIPClient {
         var payload = Data(capacity: 2)
         payload.appendUInt16LE(whiteBalance.wireValue)
         try await setExtDeviceProperty(.whiteBalance, payload: payload)
+    }
+
+    // --- 精准色温 Color Temperature (0xD20F, UInt16 LE: 2500...9900 K) ---
+
+    /// 获取当前色温值 (K)
+    public func getColorTemperature() async throws -> UInt16 {
+        let state = try await fetchCameraState()
+        guard let kelvin = state.colorTemperature else {
+            throw SonyPTPIPError.propertyNotAvailable(SonyPTPPropCode.colorTemperature.rawValue)
+        }
+        return kelvin
+    }
+
+    /// 设置精准色温值 (2500K...9900K，步进 100K)
+    /// - Parameter ensureColorTempMode: 是否先自动将白平衡切换至 `C.Temp./Filter (0x8012)`
+    public func setColorTemperature(_ kelvin: UInt16, ensureColorTempMode: Bool = true) async throws {
+        let clamped = min(max((kelvin / 100) * 100, 2500), 9900)
+        if ensureColorTempMode {
+            try? await setWhiteBalance(.colorTempFilter)
+        }
+        var payload = Data(capacity: 2)
+        payload.appendUInt16LE(clamped)
+        try await setExtDeviceProperty(.colorTemperature, payload: payload)
+    }
+
+    // --- 曝光补偿 Exposure Bias Compensation (0x5010, Int16 LE: 1/1000 EV) ---
+
+    /// 获取当前曝光补偿
+    public func getExposureBias() async throws -> SonyExposureBias {
+        let state = try await fetchCameraState()
+        guard let ev = state.exposureBias else {
+            throw SonyPTPIPError.propertyNotAvailable(SonyPTPPropCode.exposureBias.rawValue)
+        }
+        return ev
+    }
+
+    /// 修改曝光补偿 (通过 0x9205 下发 2 字节 Int16 LE，如 -1000 = -1.0 EV, +300 = +0.3 EV)
+    public func setExposureBias(_ bias: SonyExposureBias) async throws {
+        var payload = Data(capacity: 2)
+        payload.appendUInt16LE(UInt16(bitPattern: bias.rawMilliEV))
+        try await setExtDeviceProperty(.exposureBias, payload: payload)
     }
 
     // --- 触控对焦坐标下发 Touch Focus (0xD2DC, UInt32 LE + 可选 S1 0xD2C1) ---

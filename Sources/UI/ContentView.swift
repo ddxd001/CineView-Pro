@@ -62,9 +62,12 @@ public enum MonitorConnectionMode: String, CaseIterable, Sendable, Identifiable 
 
 /// 画面安全框 / 裁切参考线比例
 public enum FrameGuideAspect: String, CaseIterable, Sendable, Identifiable {
-    case off      = "关闭"
-    case scope239 = "2.39:1"
-    case wide169  = "16:9"
+    case off         = "关闭"
+    case scope239    = "2.39:1"
+    case scope235    = "2.35:1"
+    case wide169     = "16:9"
+    case classic43   = "4:3"
+    case square11    = "1:1"
     case vertical916 = "9:16"
 
     public var id: String { rawValue }
@@ -73,7 +76,10 @@ public enum FrameGuideAspect: String, CaseIterable, Sendable, Identifiable {
         switch self {
         case .off:         return nil
         case .scope239:    return 2.39
+        case .scope235:    return 2.35
         case .wide169:     return 16.0 / 9.0
+        case .classic43:   return 4.0 / 3.0
+        case .square11:    return 1.0
         case .vertical916: return 9.0 / 16.0
         }
     }
@@ -90,6 +96,7 @@ public enum ActiveExposureControl: String, Sendable, Identifiable {
     case shutter
     case aperture
     case iso
+    case exposureBias
     case whiteBalance
 
     public var id: String { rawValue }
@@ -99,16 +106,19 @@ public enum ActiveExposureControl: String, Sendable, Identifiable {
         case .shutter:      return "快门速度 SHUTTER"
         case .aperture:     return "光圈 APERTURE"
         case .iso:          return "感光度 ISO"
-        case .whiteBalance: return "白平衡 WB"
+        case .exposureBias: return "曝光补偿 EV (0x5010)"
+        case .whiteBalance: return "白平衡 & 色温 (0x5005 / 0xD20F)"
         }
     }
 }
 
 /// 示波器浮窗展示模式
 public enum ScopeDisplayMode: String, CaseIterable, Sendable {
-    case waveform  = "波形"
-    case histogram = "直方图"
-    case dual      = "双显"
+    case waveform    = "波形"
+    case parade      = "分量"
+    case vectorscope = "矢量"
+    case histogram   = "直方图"
+    case dual        = "双显"
 }
 
 /// 触控对焦视觉反馈标记
@@ -231,7 +241,9 @@ public final class MonitorViewModel {
     public var currentShutter: SonyShutterSpeed = .fraction(1, 50)
     public var currentAperture: SonyAperture = SonyAperture(fStop: 2.8)
     public var currentISO: SonyISOValue = .manual(800)
+    public var currentExposureBias: SonyExposureBias = SonyExposureBias(rawMilliEV: 0)
     public var currentWhiteBalance: SonyWhiteBalance = .daylight
+    public var currentColorTemp: UInt16 = 5600
     public var batteryPercent: Int = 86
     public var isRecording: Bool = false
     public var recordingSeconds: Int = 0
@@ -241,7 +253,10 @@ public final class MonitorViewModel {
         didSet { renderer?.settings = renderSettings }
     }
     public var loadedLUTName: String?
+    public var savedLUTs: [SavedLUTItem] = []
+    public var activeSavedLUTID: String?
     public var frameGuide: FrameGuideAspect = .off
+    public var isGridEnabled: Bool = false
     public var isScopesVisible: Bool = false
     public var scopeDisplayMode: ScopeDisplayMode = .dual
     public var latestScope: ScopeAnalysisResult?
@@ -268,6 +283,7 @@ public final class MonitorViewModel {
         case peaking
         case zebra
         case guides
+        case flip
         public var id: String { rawValue }
     }
 
@@ -289,9 +305,17 @@ public final class MonitorViewModel {
         .manual(3200), .manual(6400), .manual(12800), .manual(25600)
     ]
 
+    public let exposureBiasPresets: [SonyExposureBias] = SonyExposureBias.standardThirdStopPresets
+
     public let whiteBalancePresets: [SonyWhiteBalance] = [
         .auto, .daylight, .shade, .cloudy, .incandescent,
         .fluorescentDayWhite, .fluorescentDaylight, .colorTempFilter, .custom1, .custom2
+    ]
+
+    /// 精准色温 K 值常用表 (2500K...9900K，步进 100K/200K 常用电影色温)
+    public let colorTempPresets: [UInt16] = [
+        2500, 2800, 3000, 3200, 3500, 3800, 4000, 4300, 4500, 4800,
+        5000, 5200, 5400, 5600, 5800, 6000, 6500, 7000, 7500, 8000, 9000, 9900
     ]
 
     public init() {
@@ -309,6 +333,7 @@ public final class MonitorViewModel {
             self.rendererInitError = error.localizedDescription
             renderSettings.isScopesEnabled = isScopesVisible
         }
+        reloadSavedLUTsAndRestoreLast()
     }
 
     // MARK: - 连接与信号源切换
@@ -513,6 +538,8 @@ public final class MonitorViewModel {
         if let aperture = snap.aperture { currentAperture = aperture }
         if let iso = snap.iso { currentISO = iso }
         if let wb = snap.whiteBalance { currentWhiteBalance = wb }
+        if let k = snap.colorTemperature, k >= 2500, k <= 9900 { currentColorTemp = k }
+        if let ev = snap.exposureBias { currentExposureBias = ev }
 
         // 解析标准 PTP BatteryLevel (0x5001, UInt8 0...100)
         if let bat = snap.rawProperties[0x5001]?.uint8Value {
@@ -560,6 +587,25 @@ public final class MonitorViewModel {
         Task {
             do { try await client.setWhiteBalance(value) }
             catch { showBanner("白平衡设置失败: \(error.localizedDescription)") }
+        }
+    }
+
+    public func setColorTemperature(_ kelvin: UInt16) {
+        currentColorTemp = kelvin
+        currentWhiteBalance = .colorTempFilter
+        guard let client = ptpClient else { return }
+        Task {
+            do { try await client.setColorTemperature(kelvin, ensureColorTempMode: true) }
+            catch { showBanner("色温设置失败: \(error.localizedDescription)") }
+        }
+    }
+
+    public func setExposureBias(_ bias: SonyExposureBias) {
+        currentExposureBias = bias
+        guard let client = ptpClient else { return }
+        Task {
+            do { try await client.setExposureBias(bias) }
+            catch { showBanner("曝光补偿设置失败: \(error.localizedDescription)") }
         }
     }
 
@@ -636,7 +682,22 @@ public final class MonitorViewModel {
         }
     }
 
-    // MARK: - 3D LUT 文件导入
+    // MARK: - 3D LUT 多文件本地收藏夹与导入
+
+    public func reloadSavedLUTsAndRestoreLast() {
+        savedLUTs = LUTLibraryManager.listSavedLUTs()
+        if let lastID = LUTLibraryManager.lastSelectedLUTID,
+           let item = savedLUTs.first(where: { $0.id == lastID }),
+           let renderer {
+            do {
+                try renderer.loadCubeLUT(from: item.fileURL, autoEnable: false)
+                self.loadedLUTName = item.displayName
+                self.activeSavedLUTID = item.id
+            } catch {
+                logger.warning("恢复上次 LUT 失败: \(error.localizedDescription, privacy: .public)")
+            }
+        }
+    }
 
     public func importCubeLUT(result: Result<[URL], Error>) {
         switch result {
@@ -649,13 +710,46 @@ public final class MonitorViewModel {
                 if didStartAccess { url.stopAccessingSecurityScopedResource() }
             }
             do {
-                try renderer.loadCubeLUT(from: url, autoEnable: true)
-                self.loadedLUTName = renderer.loadedLUTTitle ?? url.deletingPathExtension().lastPathComponent
+                let saved = try LUTLibraryManager.importLUT(from: url)
+                savedLUTs = LUTLibraryManager.listSavedLUTs()
+                try renderer.loadCubeLUT(from: saved.fileURL, autoEnable: true)
+                self.loadedLUTName = saved.displayName
+                self.activeSavedLUTID = saved.id
                 self.renderSettings.isLUTEnabled = true
-                showBanner("已载入 LUT: \(self.loadedLUTName ?? "")")
+                showBanner("已收藏并启用 LUT: \(saved.displayName)")
             } catch {
                 showBanner(error.localizedDescription)
             }
+        }
+    }
+
+    public func selectSavedLUT(_ item: SavedLUTItem) {
+        guard let renderer else { return }
+        do {
+            try renderer.loadCubeLUT(from: item.fileURL, autoEnable: true)
+            LUTLibraryManager.setLastSelectedLUTID(item.id)
+            self.loadedLUTName = item.displayName
+            self.activeSavedLUTID = item.id
+            self.renderSettings.isLUTEnabled = true
+            showBanner("已切换 LUT: \(item.displayName)")
+        } catch {
+            showBanner("LUT 加载失败: \(error.localizedDescription)")
+        }
+    }
+
+    public func deleteSavedLUT(_ item: SavedLUTItem) {
+        do {
+            try LUTLibraryManager.deleteLUT(item)
+            savedLUTs = LUTLibraryManager.listSavedLUTs()
+            if activeSavedLUTID == item.id {
+                activeSavedLUTID = nil
+                loadedLUTName = nil
+                renderer?.clearLUT()
+                renderSettings.isLUTEnabled = false
+            }
+            showBanner("已移除 LUT: \(item.displayName)")
+        } catch {
+            showBanner("删除 LUT 失败: \(error.localizedDescription)")
         }
     }
 
@@ -936,11 +1030,12 @@ public struct ContentView: View {
             MonitorMetalView(renderer: vm.renderer)
                 .frame(width: containerSize.width, height: containerSize.height)
 
-            // 构图安全框参考线（精准贴合当前有效视频区域）
-            if let guideAspect = vm.frameGuide.aspectRatio {
+            // 构图安全框参考线 + 三分九宫格（精准贴合当前有效视频区域）
+            if vm.frameGuide.aspectRatio != nil || vm.isGridEnabled {
                 FrameGuideOverlay(
                     videoRect: videoRect,
-                    guideAspect: guideAspect,
+                    guideAspect: vm.frameGuide.aspectRatio,
+                    showRuleOfThirds: vm.isGridEnabled,
                     label: vm.frameGuide.rawValue
                 )
                 .allowsHitTesting(false)
@@ -1073,8 +1168,15 @@ public struct ContentView: View {
             return nil
         }
 
-        let normX = (unzoomedPt.x - videoRect.minX) / videoRect.width
-        let normY = (unzoomedPt.y - videoRect.minY) / videoRect.height
+        var normX = (unzoomedPt.x - videoRect.minX) / videoRect.width
+        var normY = (unzoomedPt.y - videoRect.minY) / videoRect.height
+        // 画面处于水平镜像 / 垂直翻转时，自动同步反向映射触控对焦坐标，确保指哪打哪
+        if vm.renderSettings.flipHorizontal {
+            normX = 1.0 - normX
+        }
+        if vm.renderSettings.flipVertical {
+            normY = 1.0 - normY
+        }
         return TouchFocusPoint(x: Double(normX), y: Double(normY))
     }
 
@@ -1145,7 +1247,7 @@ public struct ContentView: View {
 
             Spacer(minLength: 8)
 
-            // 中间：实时曝光参数胶囊 (快门 | 光圈 | ISO | 白平衡)
+            // 中间：实时曝光参数胶囊 (快门 | 光圈 | ISO | 曝光补偿 | 白平衡/色温)
             HStack(spacing: 2) {
                 exposurePillCell(
                     label: "SS",
@@ -1166,8 +1268,14 @@ public struct ContentView: View {
                 )
                 pillDivider
                 exposurePillCell(
+                    label: "EV",
+                    value: vm.currentExposureBias.description,
+                    control: .exposureBias
+                )
+                pillDivider
+                exposurePillCell(
                     label: "WB",
-                    value: vm.currentWhiteBalance.description,
+                    value: vm.currentWhiteBalance == .colorTempFilter ? "\(vm.currentColorTemp)K" : vm.currentWhiteBalance.description,
                     control: .whiteBalance
                 )
             }
@@ -1269,15 +1377,15 @@ public struct ContentView: View {
     // MARK: - LAYER 2B: 右侧悬浮专业工具栏
 
     private var rightFloatingToolbar: some View {
-        VStack(spacing: 8) {
-            // 1. 3D LUT 开关 / 导入
+        VStack(spacing: 5) {
+            // 1. 3D LUT 开关 / 本地收藏夹
             toolButton(
                 title: "LUT",
                 icon: "cube.transparent",
                 isActive: vm.renderSettings.isLUTEnabled,
                 action: {
                     if vm.loadedLUTName == nil {
-                        vm.isLUTImporterPresented = true
+                        toggleInspector(.lut)
                     } else {
                         vm.renderSettings.isLUTEnabled.toggle()
                     }
@@ -1285,9 +1393,9 @@ public struct ContentView: View {
                 onLongPress: { toggleInspector(.lut) }
             )
 
-            // 2. 波形图 & 直方图浮窗
+            // 2. 专业示波器浮窗 (波形 / RGB分量 / 矢量 / 直方图)
             toolButton(
-                title: "波形",
+                title: "示波器",
                 icon: "waveform.path.ecg",
                 isActive: vm.isScopesVisible,
                 action: {
@@ -1330,18 +1438,29 @@ public struct ContentView: View {
                 onLongPress: { toggleInspector(.zebra) }
             )
 
-            // 6. 安全框比例 (2.39:1 / 16:9 / 9:16)
+            // 6. 安全框比例 & 三分九宫格
             toolButton(
-                title: vm.frameGuide == .off ? "安全框" : vm.frameGuide.rawValue,
+                title: vm.frameGuide == .off ? (vm.isGridEnabled ? "三分线" : "安全框") : vm.frameGuide.rawValue,
                 icon: "viewfinder.rectangular",
-                isActive: vm.frameGuide != .off,
+                isActive: vm.frameGuide != .off || vm.isGridEnabled,
                 action: {
                     vm.frameGuide = vm.frameGuide.next
                 },
                 onLongPress: { toggleInspector(.guides) }
             )
 
-            // 7. 变形镜头反挤压 (1.0x / 1.33x / 1.5x / 2.0x)
+            // 7. 画面水平镜像 / 垂直翻转 (单击切换水平镜像，长按展开 H/V 面板)
+            toolButton(
+                title: flipButtonTitle,
+                icon: "arrow.left.and.right.righttriangle.left.righttriangle.right",
+                isActive: vm.renderSettings.flipHorizontal || vm.renderSettings.flipVertical,
+                action: {
+                    vm.renderSettings.flipHorizontal.toggle()
+                },
+                onLongPress: { toggleInspector(.flip) }
+            )
+
+            // 8. 变形镜头反挤压 (1.0x / 1.33x / 1.5x / 2.0x)
             toolButton(
                 title: vm.renderSettings.desqueeze.displayName,
                 icon: "arrow.left.and.right.square",
@@ -1354,13 +1473,22 @@ public struct ContentView: View {
                 }
             )
         }
-        .padding(.vertical, 8)
-        .padding(.horizontal, 6)
-        .background(.black.opacity(0.68), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .padding(.vertical, 6)
+        .padding(.horizontal, 5)
+        .background(.black.opacity(0.68), in: RoundedRectangle(cornerRadius: 15, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
+            RoundedRectangle(cornerRadius: 15, style: .continuous)
                 .stroke(.white.opacity(0.14), lineWidth: 0.6)
         )
+    }
+
+    private var flipButtonTitle: String {
+        switch (vm.renderSettings.flipHorizontal, vm.renderSettings.flipVertical) {
+        case (true, true):  return "H+V"
+        case (true, false): return "镜像H"
+        case (false, true): return "翻转V"
+        case (false, false): return "翻转"
+        }
     }
 
     private func toolButton(
@@ -1371,17 +1499,17 @@ public struct ContentView: View {
         onLongPress: (() -> Void)? = nil
     ) -> some View {
         Button(action: action) {
-            VStack(spacing: 2) {
+            VStack(spacing: 1) {
                 Image(systemName: icon)
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(.system(size: 12, weight: .semibold))
                 Text(title)
-                    .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                    .font(.system(size: 7.5, weight: .semibold, design: .monospaced))
                     .lineLimit(1)
                     .minimumScaleFactor(0.7)
             }
             .foregroundStyle(isActive ? .black : .white.opacity(0.88))
-            .frame(width: 44, height: 36)
-            .background(isActive ? Color.yellow : Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+            .frame(width: 42, height: 32)
+            .background(isActive ? Color.yellow : Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         }
         .buttonStyle(.plain)
         .simultaneousGesture(
@@ -1465,6 +1593,16 @@ public struct ContentView: View {
                             }
                         }
 
+                    case .exposureBias:
+                        ForEach(vm.exposureBiasPresets, id: \.self) { preset in
+                            wheelChip(
+                                title: preset.description,
+                                isSelected: vm.currentExposureBias == preset
+                            ) {
+                                vm.setExposureBias(preset)
+                            }
+                        }
+
                     case .whiteBalance:
                         ForEach(vm.whiteBalancePresets, id: \.self) { preset in
                             wheelChip(
@@ -1477,6 +1615,32 @@ public struct ContentView: View {
                     }
                 }
                 .padding(.horizontal, 14)
+            }
+
+            // 当选中白平衡时，下方附加 2500K–9900K 精准色温滚轮 (0xD20F)
+            if control == .whiteBalance {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        Text("K")
+                            .font(.system(size: 10, weight: .bold, design: .monospaced))
+                            .foregroundStyle(.cyan)
+                        ForEach(vm.colorTempPresets, id: \.self) { kelvin in
+                            let selected = vm.currentWhiteBalance == .colorTempFilter && vm.currentColorTemp == kelvin
+                            Button("\(kelvin)K") {
+                                let haptic = UISelectionFeedbackGenerator()
+                                haptic.selectionChanged()
+                                vm.setColorTemperature(kelvin)
+                            }
+                            .font(.system(size: 11, weight: selected ? .bold : .medium, design: .monospaced))
+                            .foregroundStyle(selected ? .black : .cyan)
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 4)
+                            .background(selected ? Color.cyan : Color.cyan.opacity(0.14), in: Capsule())
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(.horizontal, 14)
+                }
             }
         }
         .padding(.vertical, 10)
@@ -1517,39 +1681,67 @@ public struct ContentView: View {
                 Button {
                     vm.isLUTImporterPresented = true
                 } label: {
-                    Label("导入 .cube", systemImage: "folder.badge.plus")
-                        .font(.system(size: 12, weight: .semibold))
+                    Label("导入", systemImage: "folder.badge.plus")
+                        .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(.black)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 5)
                         .background(Color.yellow, in: Capsule())
                 }
                 .buttonStyle(.plain)
 
-                Button("演示 LUT") {
-                    vm.loadBuiltInDemoLUT()
-                }
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(.white)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 6)
-                .background(Color.white.opacity(0.14), in: Capsule())
-                .buttonStyle(.plain)
+                // 本地持久化多 .cube LUT 收藏夹横向切换条
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        Button("演示 LUT") {
+                            vm.activeSavedLUTID = nil
+                            vm.loadBuiltInDemoLUT()
+                        }
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(vm.activeSavedLUTID == nil && vm.renderSettings.isLUTEnabled ? .black : .white)
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 5)
+                        .background(
+                            vm.activeSavedLUTID == nil && vm.renderSettings.isLUTEnabled ? Color.yellow : Color.white.opacity(0.14),
+                            in: Capsule()
+                        )
+                        .buttonStyle(.plain)
 
-                if let name = vm.loadedLUTName {
-                    Text(name)
-                        .font(.system(size: 11, design: .monospaced))
-                        .foregroundStyle(.white.opacity(0.8))
-                        .lineLimit(1)
+                        ForEach(vm.savedLUTs) { item in
+                            let isCurrent = vm.activeSavedLUTID == item.id && vm.renderSettings.isLUTEnabled
+                            HStack(spacing: 4) {
+                                Button(item.displayName) {
+                                    vm.selectSavedLUT(item)
+                                }
+                                .font(.system(size: 11, weight: isCurrent ? .bold : .medium, design: .monospaced))
+                                .foregroundStyle(isCurrent ? .black : .white)
+                                .lineLimit(1)
+                                .buttonStyle(.plain)
+
+                                Button {
+                                    vm.deleteSavedLUT(item)
+                                } label: {
+                                    Image(systemName: "xmark")
+                                        .font(.system(size: 8, weight: .bold))
+                                        .foregroundStyle(isCurrent ? .black.opacity(0.7) : .white.opacity(0.55))
+                                }
+                                .buttonStyle(.plain)
+                            }
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 5)
+                            .background(isCurrent ? Color.yellow : Color.white.opacity(0.14), in: Capsule())
+                        }
+                    }
                 }
+                .frame(maxWidth: 260)
 
                 HStack(spacing: 6) {
-                    Text("强度 \(Int(vm.renderSettings.lutIntensity * 100))%")
+                    Text("\(Int(vm.renderSettings.lutIntensity * 100))%")
                         .font(.system(size: 11, design: .monospaced))
                         .foregroundStyle(.white.opacity(0.8))
                     Slider(value: $vm.renderSettings.lutIntensity, in: 0...1)
                         .tint(.yellow)
-                        .frame(width: 110)
+                        .frame(width: 90)
                 }
 
             case .peaking:
@@ -1601,21 +1793,73 @@ public struct ContentView: View {
                 }
 
             case .guides:
-                Text("安全框")
+                Button {
+                    vm.isGridEnabled.toggle()
+                } label: {
+                    Label("三分线", systemImage: "grid")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(vm.isGridEnabled ? .black : .white)
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 5)
+                        .background(vm.isGridEnabled ? Color.cyan : Color.white.opacity(0.14), in: Capsule())
+                }
+                .buttonStyle(.plain)
+
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(FrameGuideAspect.allCases) { guide in
+                            Button(guide.rawValue) {
+                                vm.frameGuide = guide
+                            }
+                            .font(.system(size: 11, weight: .bold, design: .monospaced))
+                            .foregroundStyle(vm.frameGuide == guide ? .black : .white)
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 5)
+                            .background(
+                                vm.frameGuide == guide ? Color.yellow : Color.white.opacity(0.14),
+                                in: Capsule()
+                            )
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+                .frame(maxWidth: 340)
+
+            case .flip:
+                Text("画面翻转")
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(.white.opacity(0.75))
-                ForEach(FrameGuideAspect.allCases) { guide in
-                    Button(guide.rawValue) {
-                        vm.frameGuide = guide
+
+                Button("水平镜像 H") {
+                    vm.renderSettings.flipHorizontal.toggle()
+                }
+                .font(.system(size: 11, weight: .bold))
+                .foregroundStyle(vm.renderSettings.flipHorizontal ? .black : .white)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(vm.renderSettings.flipHorizontal ? Color.yellow : Color.white.opacity(0.14), in: Capsule())
+                .buttonStyle(.plain)
+
+                Button("垂直翻转 V") {
+                    vm.renderSettings.flipVertical.toggle()
+                }
+                .font(.system(size: 11, weight: .bold))
+                .foregroundStyle(vm.renderSettings.flipVertical ? .black : .white)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(vm.renderSettings.flipVertical ? Color.yellow : Color.white.opacity(0.14), in: Capsule())
+                .buttonStyle(.plain)
+
+                if vm.renderSettings.flipHorizontal || vm.renderSettings.flipVertical {
+                    Button("复位") {
+                        vm.renderSettings.flipHorizontal = false
+                        vm.renderSettings.flipVertical = false
                     }
-                    .font(.system(size: 11, weight: .bold, design: .monospaced))
-                    .foregroundStyle(vm.frameGuide == guide ? .black : .white)
-                    .padding(.horizontal, 10)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.85))
+                    .padding(.horizontal, 9)
                     .padding(.vertical, 5)
-                    .background(
-                        vm.frameGuide == guide ? Color.yellow : Color.white.opacity(0.14),
-                        in: Capsule()
-                    )
+                    .background(Color.white.opacity(0.14), in: Capsule())
                     .buttonStyle(.plain)
                 }
             }
@@ -1695,55 +1939,72 @@ public struct ContentView: View {
 
 // MARK: - 7. 专业辅助叠加组件 (安全框 / 对焦框 / 假色标尺 / 实时示波器浮窗 / 连接弹窗)
 
-/// 安全框与裁切参考线叠加层 (2.39:1、16:9、9:16 竖屏裁切)
+/// 安全框与三分构图九宫格叠加层 (2.39:1 / 2.35:1 / 16:9 / 4:3 / 1:1 / 9:16 + 三分线)
 private struct FrameGuideOverlay: View {
     let videoRect: CGRect
-    let guideAspect: CGFloat
+    let guideAspect: CGFloat?
+    let showRuleOfThirds: Bool
     let label: String
 
     var body: some View {
         Canvas { context, _ in
             guard videoRect.width > 1, videoRect.height > 1 else { return }
 
-            let currentAspect = videoRect.width / videoRect.height
             let targetRect: CGRect
-            if currentAspect > guideAspect {
-                // 竖屏 9:16 等更窄比例：居中裁剪左右
-                let w = videoRect.height * guideAspect
-                targetRect = CGRect(
-                    x: videoRect.midX - w * 0.5,
-                    y: videoRect.minY,
-                    width: w,
-                    height: videoRect.height
+            if let guideAspect {
+                let currentAspect = videoRect.width / videoRect.height
+                if currentAspect > guideAspect {
+                    let w = videoRect.height * guideAspect
+                    targetRect = CGRect(
+                        x: videoRect.midX - w * 0.5,
+                        y: videoRect.minY,
+                        width: w,
+                        height: videoRect.height
+                    )
+                } else {
+                    let h = videoRect.width / guideAspect
+                    targetRect = CGRect(
+                        x: videoRect.minX,
+                        y: videoRect.midY - h * 0.5,
+                        width: videoRect.width,
+                        height: h
+                    )
+                }
+
+                // 1. 裁切外区半透明暗幕 (55% 遮罩，保留周围视野构图)
+                var mattePath = Path(videoRect)
+                mattePath.addRect(targetRect)
+                context.fill(mattePath, with: .color(.black.opacity(0.55)), style: FillStyle(eoFill: true))
+
+                // 2. 精细安全框边界线
+                context.stroke(Path(targetRect), with: .color(.white.opacity(0.85)), lineWidth: 1.0)
+
+                // 3. 90% 动作安全区虚线框
+                let safeRect = targetRect.insetBy(dx: targetRect.width * 0.05, dy: targetRect.height * 0.05)
+                context.stroke(
+                    Path(safeRect),
+                    with: .color(.white.opacity(0.32)),
+                    style: StrokeStyle(lineWidth: 0.6, dash: [4, 4])
                 )
             } else {
-                // 2.39:1 等更宽比例：居中裁剪上下
-                let h = videoRect.width / guideAspect
-                targetRect = CGRect(
-                    x: videoRect.minX,
-                    y: videoRect.midY - h * 0.5,
-                    width: videoRect.width,
-                    height: h
-                )
+                targetRect = videoRect
             }
 
-            // 1. 裁切外区半透明暗幕 (55% 遮罩，保留周围视野构图)
-            var mattePath = Path(videoRect)
-            mattePath.addRect(targetRect)
-            context.fill(mattePath, with: .color(.black.opacity(0.55)), style: FillStyle(eoFill: true))
+            // 4. 三分构图九宫格 (Rule of Thirds)
+            if showRuleOfThirds {
+                var grid = Path()
+                for i in 1...2 {
+                    let x = targetRect.minX + targetRect.width * (CGFloat(i) / 3.0)
+                    let y = targetRect.minY + targetRect.height * (CGFloat(i) / 3.0)
+                    grid.move(to: CGPoint(x: x, y: targetRect.minY))
+                    grid.addLine(to: CGPoint(x: x, y: targetRect.maxY))
+                    grid.move(to: CGPoint(x: targetRect.minX, y: y))
+                    grid.addLine(to: CGPoint(x: targetRect.maxX, y: y))
+                }
+                context.stroke(grid, with: .color(.white.opacity(0.45)), lineWidth: 0.7)
+            }
 
-            // 2. 精细安全框边界线
-            context.stroke(Path(targetRect), with: .color(.white.opacity(0.85)), lineWidth: 1.0)
-
-            // 3. 90% 动作安全区虚线框
-            let safeRect = targetRect.insetBy(dx: targetRect.width * 0.05, dy: targetRect.height * 0.05)
-            context.stroke(
-                Path(safeRect),
-                with: .color(.white.opacity(0.32)),
-                style: StrokeStyle(lineWidth: 0.6, dash: [4, 4])
-            )
-
-            // 4. 中心十字准星
+            // 5. 中心十字准星
             var cross = Path()
             cross.move(to: CGPoint(x: targetRect.midX - 8, y: targetRect.midY))
             cross.addLine(to: CGPoint(x: targetRect.midX + 8, y: targetRect.midY))
@@ -1841,15 +2102,26 @@ private struct ScopesFloatingWidget: View {
                 .buttonStyle(.plain)
             }
 
-            // 波形图 / 直方图 Canvas 绘制区
+            // 示波器 Canvas 绘制区：支持 亮度波形 / RGB 分量波形 (Parade) / 矢量示波器 (Vectorscope) / RGB 直方图 / 双显
             HStack(spacing: 8) {
-                if mode == .waveform || mode == .dual {
+                switch mode {
+                case .waveform:
                     waveformCanvas
-                        .frame(width: mode == .dual ? 168 : 240, height: 96)
-                }
-                if mode == .histogram || mode == .dual {
+                        .frame(width: 240, height: 100)
+                case .parade:
+                    paradeCanvas
+                        .frame(width: 252, height: 100)
+                case .vectorscope:
+                    vectorscopeCanvas
+                        .frame(width: 118, height: 118)
+                case .histogram:
                     histogramCanvas
-                        .frame(width: mode == .dual ? 136 : 220, height: 96)
+                        .frame(width: 220, height: 100)
+                case .dual:
+                    waveformCanvas
+                        .frame(width: 168, height: 106)
+                    vectorscopeCanvas
+                        .frame(width: 106, height: 106)
                 }
             }
         }
@@ -1859,6 +2131,128 @@ private struct ScopesFloatingWidget: View {
             RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .stroke(.white.opacity(0.18), lineWidth: 0.6)
         )
+    }
+
+    private var paradeCanvas: some View {
+        Canvas { context, size in
+            // 0 / 25 / 50 / 75 / 100 IRE 参考线 + 3 分区竖线
+            for ire in [0.0, 0.25, 0.5, 0.75, 1.0] {
+                let y = size.height * (1.0 - ire)
+                var line = Path()
+                line.move(to: CGPoint(x: 0, y: y))
+                line.addLine(to: CGPoint(x: size.width, y: y))
+                context.stroke(line, with: .color(.white.opacity(0.14)), lineWidth: 0.5)
+            }
+            let thirdW = size.width / 3.0
+            for idx in 1...2 {
+                var sep = Path()
+                sep.move(to: CGPoint(x: thirdW * CGFloat(idx), y: 0))
+                sep.addLine(to: CGPoint(x: thirdW * CGFloat(idx), y: size.height))
+                context.stroke(sep, with: .color(.white.opacity(0.22)), lineWidth: 0.6)
+            }
+
+            guard let scope, scope.paradeSize > 0 else { return }
+            let s = scope.paradeSize
+            let cellW = thirdW / CGFloat(s)
+            let cellH = size.height / CGFloat(s)
+
+            let channels: [([Float], Color, CGFloat)] = [
+                (scope.redParade,   Color(red: 1.0, green: 0.22, blue: 0.22), 0),
+                (scope.greenParade, Color(red: 0.20, green: 0.96, blue: 0.36), thirdW),
+                (scope.blueParade,  Color(red: 0.26, green: 0.58, blue: 1.0), thirdW * 2.0)
+            ]
+
+            for (data, color, xBase) in channels {
+                guard data.count == s * s else { continue }
+                for row in stride(from: 0, to: s, by: 2) {
+                    let py = size.height - (CGFloat(row + 1) * cellH)
+                    let rowOffset = row * s
+                    for col in stride(from: 0, to: s, by: 2) {
+                        let intensity = data[rowOffset + col]
+                        if intensity > 0.05 {
+                            let rect = CGRect(x: xBase + CGFloat(col) * cellW, y: py, width: max(cellW * 2, 1.1), height: max(cellH * 2, 1.1))
+                            context.fill(Path(rect), with: .color(color.opacity(Double(intensity))))
+                        }
+                    }
+                }
+            }
+        }
+        .background(Color.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 6))
+    }
+
+    private var vectorscopeCanvas: some View {
+        Canvas { context, size in
+            let cx = size.width * 0.5
+            let cy = size.height * 0.5
+            let radius = min(size.width, size.height) * 0.46
+
+            // 1. 外圈 & 75% 饱和度内圈
+            let outerCircle = CGRect(x: cx - radius, y: cy - radius, width: radius * 2, height: radius * 2)
+            let innerR = radius * 0.75
+            let innerCircle = CGRect(x: cx - innerR, y: cy - innerR, width: innerR * 2, height: innerR * 2)
+            context.stroke(Path(ellipseIn: outerCircle), with: .color(.white.opacity(0.28)), lineWidth: 0.7)
+            context.stroke(Path(ellipseIn: innerCircle), with: .color(.white.opacity(0.14)), style: StrokeStyle(lineWidth: 0.5, dash: [3, 3]))
+
+            // 2. 十字轴线 (Cb 水平, Cr 垂直)
+            var axes = Path()
+            axes.move(to: CGPoint(x: cx - radius, y: cy))
+            axes.addLine(to: CGPoint(x: cx + radius, y: cy))
+            axes.move(to: CGPoint(x: cx, y: cy - radius))
+            axes.addLine(to: CGPoint(x: cx, y: cy + radius))
+            context.stroke(axes, with: .color(.white.opacity(0.16)), lineWidth: 0.5)
+
+            // 3. 专业肤色校准线 (Skin Tone / I-Line，约 123° 方向，位于第二象限左上)
+            let skinAngle = 123.0 * .pi / 180.0
+            var skinLine = Path()
+            skinLine.move(to: CGPoint(x: cx, y: cy))
+            skinLine.addLine(to: CGPoint(
+                x: cx + CGFloat(cos(skinAngle)) * radius,
+                y: cy - CGFloat(sin(skinAngle)) * radius
+            ))
+            context.stroke(skinLine, with: .color(Color(red: 1.0, green: 0.62, blue: 0.42).opacity(0.75)), lineWidth: 0.9)
+
+            // 4. Rec.709 75% 六原色目标点 (R, Mg, B, Cy, G, Yl)
+            let targets: [(CGFloat, CGFloat, Color)] = [
+                (-0.1146,  0.5000, .red),
+                ( 0.3854,  0.4542, .purple),
+                ( 0.5000, -0.0458, .blue),
+                ( 0.1146, -0.5000, .cyan),
+                (-0.3854, -0.4542, .green),
+                (-0.5000,  0.0458, .yellow)
+            ]
+            for (cb, cr, col) in targets {
+                let tx = cx + cb * 1.5 * radius
+                let ty = cy - cr * 1.5 * radius
+                let box = CGRect(x: tx - 2.5, y: ty - 2.5, width: 5, height: 5)
+                context.stroke(Path(box), with: .color(col.opacity(0.75)), lineWidth: 0.9)
+            }
+
+            // 5. 绘制实时 Cb/Cr 散点云
+            guard let scope, scope.vectorscopeSize > 0 else { return }
+            let s = scope.vectorscopeSize
+            let data = scope.vectorscopeIntensities
+            guard data.count == s * s else { return }
+
+            for row in stride(from: 0, to: s, by: 2) {
+                let cr = (CGFloat(row) / CGFloat(s - 1)) - 0.5
+                let py = cy - cr * 2.0 * radius
+                let rowOffset = row * s
+                for col in stride(from: 0, to: s, by: 2) {
+                    let intensity = data[rowOffset + col]
+                    if intensity > 0.05 {
+                        let cb = (CGFloat(col) / CGFloat(s - 1)) - 0.5
+                        let px = cx + cb * 2.0 * radius
+                        // 根据 Cb/Cr 方向近似着色，呈现电影级彩色矢量散点
+                        let rr = min(max(0.5 + 1.4 * cr, 0.15), 1.0)
+                        let gg = min(max(0.5 - 0.34 * cb - 0.71 * cr, 0.15), 1.0)
+                        let bb = min(max(0.5 + 1.77 * cb, 0.15), 1.0)
+                        let dot = CGRect(x: px - 0.9, y: py - 0.9, width: 1.8, height: 1.8)
+                        context.fill(Path(dot), with: .color(Color(red: Double(rr), green: Double(gg), blue: Double(bb)).opacity(Double(intensity))))
+                    }
+                }
+            }
+        }
+        .background(Color.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 6))
     }
 
     private var waveformCanvas: some View {

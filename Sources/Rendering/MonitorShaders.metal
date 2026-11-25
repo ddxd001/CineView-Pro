@@ -11,7 +11,7 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// MARK: - 共享 Uniform 结构 (严格 16 字节对齐，总长 112 字节，与 Swift MonitorUniforms 一一对应)
+// MARK: - 共享 Uniform 结构 (严格 16 字节对齐，总长 128 字节，与 Swift MonitorUniforms 一一对应)
 
 struct MonitorUniforms {
     // Block 0 (0...15)
@@ -47,6 +47,12 @@ struct MonitorUniforms {
     uint  waveformWidth;        // 波形图水平列数 (默认 256)
     uint  waveformHeight;       // 波形图垂直 IRE 级数 (默认 128)
     uint  sampleStride;         // Compute 采样步长 (>= 1)，平衡 60fps 性能与统计精度
+
+    // Block 7 (112...127)
+    uint  flipHorizontal;       // 0 = 正常, 1 = 水平镜像翻转 (自拍/提词器)
+    uint  flipVertical;         // 0 = 正常, 1 = 垂直上下翻转 (倒装兔笼)
+    uint  paradeSize;           // RGB 分量波形单通道尺寸 (默认 128: 每通道 128×128)
+    uint  vectorscopeSize;      // 矢量示波器 Cb/Cr 边长 (默认 128: 128×128)
 };
 
 struct VertexOut {
@@ -231,6 +237,16 @@ fragment float4 monitorFragmentShader(
     }
 
     // ---------------------------------------------------------
+    // Step 1.5: 画面水平镜像 / 垂直翻转 (Flip H / Flip V)
+    // ---------------------------------------------------------
+    if (u.flipHorizontal != 0u) {
+        uv.x = 1.0f - uv.x;
+    }
+    if (u.flipVertical != 0u) {
+        uv.y = 1.0f - uv.y;
+    }
+
+    // ---------------------------------------------------------
     // Step 2: 统一双源采样 + 3D LUT 三线性插值还原
     // ---------------------------------------------------------
     float3 rawRGB     = sampleUnifiedRGB(uv, primaryTex, chromaTex, videoSampler, u.inputFormat);
@@ -313,12 +329,14 @@ fragment float4 monitorFragmentShader(
 /// [768...1023] Luma (Rec.709 Y)
 constant uint kHistBins = 256u;
 
-/// Step A: 并行清零直方图与波形图缓冲
+/// Step A: 并行清零直方图、亮度波形图、RGB 分量波形图与矢量示波器缓冲
 kernel void clearScopesKernel(
-    device uint* histogramBuffer [[buffer(0)]],
-    device uint* waveformBuffer  [[buffer(1)]],
-    constant MonitorUniforms& u  [[buffer(2)]],
-    uint gid                     [[thread_position_in_grid]]
+    device uint* histogramBuffer   [[buffer(0)]],
+    device uint* waveformBuffer    [[buffer(1)]],
+    constant MonitorUniforms& u    [[buffer(2)]],
+    device uint* paradeBuffer      [[buffer(3)]],
+    device uint* vectorscopeBuffer [[buffer(4)]],
+    uint gid                       [[thread_position_in_grid]]
 ) {
     uint histTotal = kHistBins * 4u;
     if (gid < histTotal) {
@@ -329,10 +347,23 @@ kernel void clearScopesKernel(
     if (gid < waveTotal) {
         waveformBuffer[gid] = 0u;
     }
+
+    uint paradeTotal = 3u * u.paradeSize * u.paradeSize;
+    if (gid < paradeTotal) {
+        paradeBuffer[gid] = 0u;
+    }
+
+    uint vecTotal = u.vectorscopeSize * u.vectorscopeSize;
+    if (gid < vecTotal) {
+        vectorscopeBuffer[gid] = 0u;
+    }
 }
 
-/// Step B: 并行统计当前帧的 RGB+Luma 直方图与 2D 亮度波形图分布
-/// - 使用 threadgroup 共享内存做直方图局部归约，大幅降低全局原子写竞争，保证 60fps 极低 GPU 耗时。
+/// Step B: 同一次遍历并行统计 4 套专业示波器：
+///   1) RGB + Luma 直方图 (Threadgroup 共享内存局部归约)
+///   2) 亮度波形图 (Luma Waveform)
+///   3) RGB 分量波形图 (RGB Parade: R / G / B 三平面各 128×128)
+///   4) 矢量示波器 (Rec.709 Cb/Cr 散点分布 128×128)
 kernel void analyzeScopesKernel(
     texture2d<float, access::sample> primaryTex [[texture(0)]],
     texture2d<float, access::sample> chromaTex  [[texture(1)]],
@@ -340,6 +371,8 @@ kernel void analyzeScopesKernel(
     device atomic_uint* histogramBuffer         [[buffer(0)]],
     device atomic_uint* waveformBuffer          [[buffer(1)]],
     constant MonitorUniforms& u                 [[buffer(2)]],
+    device atomic_uint* paradeBuffer            [[buffer(3)]],
+    device atomic_uint* vectorscopeBuffer       [[buffer(4)]],
     uint2 gid                                   [[thread_position_in_grid]],
     uint  localIndex                            [[thread_index_in_threadgroup]],
     uint2 tgSize                                [[threads_per_threadgroup]]
@@ -377,12 +410,15 @@ kernel void analyzeScopesKernel(
             rgb = apply3DLUT(rgb, lutTex, lutSampler, u);
         }
 
+        float r = saturate(rgb.r);
+        float g = saturate(rgb.g);
+        float b = saturate(rgb.b);
         float luma = saturate(dot(rgb, kRec709LumaWeights));
 
         // 1. 累加到线程组局部 RGB + Luma 直方图
-        uint binR = min(uint(saturate(rgb.r) * 255.0f + 0.5f), 255u);
-        uint binG = min(uint(saturate(rgb.g) * 255.0f + 0.5f), 255u);
-        uint binB = min(uint(saturate(rgb.b) * 255.0f + 0.5f), 255u);
+        uint binR = min(uint(r * 255.0f + 0.5f), 255u);
+        uint binG = min(uint(g * 255.0f + 0.5f), 255u);
+        uint binB = min(uint(b * 255.0f + 0.5f), 255u);
         uint binY = min(uint(luma * 255.0f + 0.5f), 255u);
 
         atomic_fetch_add_explicit(&localR[binR], 1u, memory_order_relaxed);
@@ -390,13 +426,34 @@ kernel void analyzeScopesKernel(
         atomic_fetch_add_explicit(&localB[binB], 1u, memory_order_relaxed);
         atomic_fetch_add_explicit(&localY[binY], 1u, memory_order_relaxed);
 
-        // 2. 累加到亮度波形图 (Waveform): X 轴对应画面水平列，Y 轴对应 0–100 IRE (0=底部, H-1=顶部)
+        // 2. 累加到亮度波形图 (Luma Waveform): X 对应画面水平列，Y 对应 0–100 IRE
         uint wfW = max(u.waveformWidth, 1u);
         uint wfH = max(u.waveformHeight, 1u);
         uint wfX = min(uint(uv.x * float(wfW)), wfW - 1u);
         uint wfY = min(uint(luma * float(wfH - 1u) + 0.5f), wfH - 1u);
-        uint wfIdx = wfY * wfW + wfX;
-        atomic_fetch_add_explicit(&waveformBuffer[wfIdx], 1u, memory_order_relaxed);
+        atomic_fetch_add_explicit(&waveformBuffer[wfY * wfW + wfX], 1u, memory_order_relaxed);
+
+        // 3. 累加到 RGB 分量波形 (RGB Parade): 3 个平面 [R: 0, G: S², B: 2*S²]
+        uint pS = max(u.paradeSize, 1u);
+        uint pPlane = pS * pS;
+        uint pX = min(uint(uv.x * float(pS)), pS - 1u);
+        uint pYR = min(uint(r * float(pS - 1u) + 0.5f), pS - 1u);
+        uint pYG = min(uint(g * float(pS - 1u) + 0.5f), pS - 1u);
+        uint pYB = min(uint(b * float(pS - 1u) + 0.5f), pS - 1u);
+        atomic_fetch_add_explicit(&paradeBuffer[pYR * pS + pX],               1u, memory_order_relaxed);
+        atomic_fetch_add_explicit(&paradeBuffer[pPlane + pYG * pS + pX],      1u, memory_order_relaxed);
+        atomic_fetch_add_explicit(&paradeBuffer[2u * pPlane + pYB * pS + pX], 1u, memory_order_relaxed);
+
+        // 4. 累加到 Rec.709 矢量示波器 (Vectorscope: X = Cb ∈ [-0.5, +0.5], Y = Cr ∈ [-0.5, +0.5])
+        //    ITU-R BT.709 色差公式：
+        //    Cb = -0.1146*R - 0.3854*G + 0.5000*B
+        //    Cr =  0.5000*R - 0.4542*G - 0.0458*B
+        float cb = -0.1146f * r - 0.3854f * g + 0.5000f * b;
+        float cr =  0.5000f * r - 0.4542f * g - 0.0458f * b;
+        uint vS = max(u.vectorscopeSize, 1u);
+        uint vX = min(uint(saturate(cb + 0.5f) * float(vS - 1u) + 0.5f), vS - 1u);
+        uint vY = min(uint(saturate(cr + 0.5f) * float(vS - 1u) + 0.5f), vS - 1u);
+        atomic_fetch_add_explicit(&vectorscopeBuffer[vY * vS + vX], 1u, memory_order_relaxed);
     }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
