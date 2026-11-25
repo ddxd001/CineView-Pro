@@ -545,26 +545,29 @@ public struct SonyDevicePropertyDescriptor: Sendable {
     }
 }
 
-/// 相机常用曝光与状态快照
+    /// 相机常用曝光与状态快照
 public struct CameraStateSnapshot: Sendable {
     public let iso: SonyISOValue?
     /// 当前机身/图像配置（如 S-Log3 最低原生 ISO 800）下实际可用的 ISO 列表 (来自 0x9209 属性 0xD21E)
     public let availableISOs: [SonyISOValue]
-    public let isISOWritable: Bool
+    /// nil 表示本次未解析到该属性描述符；true/false 表示相机明确回报是否可写
+    public let isISOWritable: Bool?
     public let shutterSpeed: SonyShutterSpeed?
     /// 当前拍摄模式（如视频 24p/60p 档位）下实际可用的快门速度列表 (来自 0x9209 属性 0xD20D)
     public let availableShutterSpeeds: [SonyShutterSpeed]
-    public let isShutterWritable: Bool
+    public let isShutterWritable: Bool?
     public let aperture: SonyAperture?
     /// 当前挂载镜头在当前焦段下实际支持调节的全部光圈档位 (来自 0x9209 属性 0x5007 动态枚举表)
     public let availableApertures: [SonyAperture]
-    /// 当前模式/镜头是否允许通过 PTP 电控调节光圈 (如手动镜头或实体光圈环未拧到 A 时为 false)
-    public let isApertureWritable: Bool
+    /// nil 表示未解析到 0x5007；false 表示相机明确回报不可电控（如手动镜头或实体光圈环未拧到 A）
+    public let isApertureWritable: Bool?
     public let whiteBalance: SonyWhiteBalance?
     public let colorTemperature: UInt16?
     public let exposureBias: SonyExposureBias?
     public let isRecording: Bool
     public let isLiveViewEnabled: Bool
+    /// 调试诊断摘要（记录 0x9209 返回字节数与解析属性个数，便于真机排查）
+    public let diagnosticSummary: String
     public let rawProperties: [UInt16: SonyDevicePropertyDescriptor]
 }
 
@@ -892,6 +895,8 @@ public actor SonyPTPIPClient {
 
     /// 缓存最近一次 0x9209 解析出的属性表
     private var latestProperties: [UInt16: SonyDevicePropertyDescriptor] = [:]
+    /// 自动探测并缓存当前机身接受的 0x9209 参数格式（SDI3 为 [0, 1] 或 [0, 0]，老固件为 []）
+    private var cachedPropInfoParams: [UInt32]?
 
     /// 异步事件广播流管理
     private var eventContinuations: [UUID: AsyncStream<SonyPTPEvent>.Continuation] = [:]
@@ -1078,6 +1083,7 @@ public actor SonyPTPIPClient {
         eventChannel = nil
         sessionInfo = nil
         latestProperties.removeAll()
+        cachedPropInfoParams = nil
 
         for (_, cont) in eventContinuations {
             cont.finish()
@@ -1330,14 +1336,40 @@ public actor SonyPTPIPClient {
     // MARK: - 4.4 相机状态获取与常用控制指令封装
 
     /// 一次性拉取相机全部 Sony 扩展属性 (`0x9209 SDIO_GetAllExtDevicePropInfo`) 并解析常用参数快照
+    /// - 自动兼容不同固件的 0x9209 参数签名：`[0, 1]` (SDI3 全量+扩展选项) -> `[0, 0]` -> `[]`
+    /// - 自动自适应 SDI3 双枚举表 / SDI2 单枚举表，避免单个未知字段导致全表解析中断
     @discardableResult
     public func fetchCameraState() async throws -> CameraStateSnapshot {
-        let resp = try await performTransaction(
-            opCode: .sdioGetAllExtDevicePropInfo,
-            dataPhase: .noDataOrDataIn,
-            parameters: []
-        )
+        let candidateParamLists: [[UInt32]]
+        if let cached = cachedPropInfoParams {
+            candidateParamLists = [cached]
+        } else {
+            candidateParamLists = [
+                [0x0000_0000, 0x0000_0001], // Sony SDI3 标准：Param1=0(全量), Param2=1(启用扩展属性)
+                [0x0000_0000, 0x0000_0000], // 备选：Param1=0, Param2=0
+                [0x0000_0000],              // 备选：单参数
+                []                          // 备选：无参数
+            ]
+        }
 
+        var chosenResp: PTPTransactionResult?
+        for params in candidateParamLists {
+            let attempt = try await performTransaction(
+                opCode: .sdioGetAllExtDevicePropInfo,
+                dataPhase: .noDataOrDataIn,
+                parameters: params
+            )
+            if attempt.responseCode == PTPResponseCode.ok.rawValue && !attempt.data.isEmpty {
+                cachedPropInfoParams = params
+                chosenResp = attempt
+                break
+            }
+            chosenResp = attempt
+        }
+
+        guard let resp = chosenResp else {
+            throw SonyPTPIPError.notConnected
+        }
         guard resp.responseCode == PTPResponseCode.ok.rawValue else {
             throw SonyPTPIPError.ptpOperationFailed(
                 opCode: SonyPTPOpCode.sdioGetAllExtDevicePropInfo.rawValue,
@@ -1345,8 +1377,22 @@ public actor SonyPTPIPClient {
             )
         }
 
-        let isSDI3 = (sessionInfo?.negotiatedSDIOVersion ?? .v3) == .v3
-        let props = Self.parseAllExtDevicePropInfo(resp.data, isSDI3: isSDI3)
+        // 同时尝试 SDI3 (双枚举) 与 SDI2 (单枚举) 解析，自动择优取覆盖核心曝光属性更多的一份
+        let prefersSDI3 = (sessionInfo?.negotiatedSDIOVersion ?? .v3) == .v3
+        let primaryParse = Self.parseAllExtDevicePropInfo(resp.data, isSDI3: prefersSDI3)
+        let altParse = Self.parseAllExtDevicePropInfo(resp.data, isSDI3: !prefersSDI3)
+
+        func coreScore(_ map: [UInt16: SonyDevicePropertyDescriptor]) -> Int {
+            var s = map.count
+            if map[SonyPTPPropCode.fNumber.rawValue] != nil { s += 500 }
+            if map[SonyPTPPropCode.shutterSpeed.rawValue] != nil { s += 500 }
+            if map[SonyPTPPropCode.isoSensitivity.rawValue] != nil { s += 500 }
+            if map[SonyPTPPropCode.whiteBalance.rawValue] != nil { s += 500 }
+            return s
+        }
+
+        let chosenParse = coreScore(altParse.properties) > coreScore(primaryParse.properties) ? altParse : primaryParse
+        let props = chosenParse.properties
         self.latestProperties = props
 
         let isoDesc = props[SonyPTPPropCode.isoSensitivity.rawValue]
@@ -1358,7 +1404,7 @@ public actor SonyPTPIPClient {
                 .filter { $0 != 0 && seen.insert($0).inserted }
                 .map(SonyISOValue.init(wireValue:))
         }()
-        let isISOWritable = (isoDesc?.getSet == 0x01) && (isoDesc?.isEnabled == 0x01)
+        let isISOWritable: Bool? = isoDesc.map { $0.getSet != 0x00 && $0.isEnabled == 0x01 }
 
         let shutterDesc = props[SonyPTPPropCode.shutterSpeed.rawValue]
         let shutter = shutterDesc?.uint32Value.map(SonyShutterSpeed.init(wireValue:))
@@ -1369,7 +1415,7 @@ public actor SonyPTPIPClient {
                 .filter { seen.insert($0).inserted }
                 .map(SonyShutterSpeed.init(wireValue:))
         }()
-        let isShutterWritable = (shutterDesc?.getSet == 0x01) && (shutterDesc?.isEnabled == 0x01)
+        let isShutterWritable: Bool? = shutterDesc.map { $0.getSet != 0x00 && $0.isEnabled == 0x01 }
 
         let apertureDesc = props[SonyPTPPropCode.fNumber.rawValue]
         let aperture = apertureDesc?.uint16Value.map(SonyAperture.init(rawValue:))
@@ -1381,12 +1427,20 @@ public actor SonyPTPIPClient {
                 .sorted()
                 .map(SonyAperture.init(rawValue:))
         }()
-        let isApertureWritable = (apertureDesc?.getSet == 0x01) && (apertureDesc?.isEnabled == 0x01)
+        let isApertureWritable: Bool? = apertureDesc.map { $0.getSet != 0x00 && $0.isEnabled == 0x01 }
+
         let wb = props[SonyPTPPropCode.whiteBalance.rawValue]?.uint16Value.map(SonyWhiteBalance.init(wireValue:))
         let colorTemp = props[SonyPTPPropCode.colorTemperature.rawValue]?.uint16Value
         let evBias = props[SonyPTPPropCode.exposureBias.rawValue]?.int16Value.map(SonyExposureBias.init(rawMilliEV:))
         let isRecording = (props[SonyPTPPropCode.recordingState.rawValue]?.uint16Value ?? 0) != 0
         let isLiveViewEnabled = (props[SonyPTPPropCode.liveViewStatus.rawValue]?.uint8Value ?? 0) != 0
+
+        func flagTag(_ desc: SonyDevicePropertyDescriptor?) -> String {
+            guard let d = desc else { return "-" }
+            return "\(d.getSet)/\(d.isEnabled)"
+        }
+        let diagBase = "0x9209(\(chosenParse.isSDI3 ? "SDI3" : "SDI2")): \(resp.data.count)B, \(props.count)/\(chosenParse.declaredCount)项 | F:\(availableApertures.count)[\(flagTag(apertureDesc))] SS:\(availableShutterSpeeds.count)[\(flagTag(shutterDesc))] ISO:\(availableISOs.count)[\(flagTag(isoDesc))]"
+        let diag = chosenParse.stopReason.isEmpty ? diagBase : "\(diagBase) | \(chosenParse.stopReason)"
 
         return CameraStateSnapshot(
             iso: iso,
@@ -1403,6 +1457,7 @@ public actor SonyPTPIPClient {
             exposureBias: evBias,
             isRecording: isRecording,
             isLiveViewEnabled: isLiveViewEnabled,
+            diagnosticSummary: diag,
             rawProperties: props
         )
     }
@@ -2051,17 +2106,35 @@ private extension SonyPTPIPClient {
     ///              - List 1: UInt16 Count1 + Count1 个值 (全部支持值)
     ///              - [仅 SDI3 / 0x012C 机型]: 紧跟 List 2: UInt16 Count2 + Count2 个值 (当前可用值)
     /// ```
-    static func parseAllExtDevicePropInfo(_ data: Data, isSDI3: Bool) -> [UInt16: SonyDevicePropertyDescriptor] {
+    struct ExtPropParseOutcome: Sendable {
+        let properties: [UInt16: SonyDevicePropertyDescriptor]
+        let declaredCount: Int
+        let isSDI3: Bool
+        let stopReason: String
+    }
+
+    static func parseAllExtDevicePropInfo(_ data: Data, isSDI3: Bool) -> ExtPropParseOutcome {
         var result: [UInt16: SonyDevicePropertyDescriptor] = [:]
-        guard data.count >= 8 else { return result }
+        guard data.count >= 8 else {
+            return ExtPropParseOutcome(properties: result, declaredCount: 0, isSDI3: isSDI3, stopReason: "len<8")
+        }
 
-        let totalCount = Int(data.readUInt64LE(at: 0))
-        var cursor = 8
+        // 兼容 8 字节 UInt64 计数头 (bytes 4..7 为 0) 与 4 字节 UInt32 计数头 (bytes 4..7 非 0)
+        let lo32 = data.readUInt32LE(at: 0)
+        let hi32 = data.readUInt32LE(at: 4)
+        let totalCount = Int(lo32)
+        let safeCount = min(totalCount, 2000)
+        var cursor = (hi32 == 0) ? 8 : 4
+        var stopReason = ""
 
-        for _ in 0..<totalCount {
+        for idx in 0..<safeCount {
             // 至少需要 6 字节头部: PropCode(2) + DataType(2) + GetSet(1) + IsEnable(1)
-            guard cursor + 6 <= data.count else { break }
+            guard cursor + 6 <= data.count else {
+                stopReason = "eof#\(idx)@\(cursor)"
+                break
+            }
 
+            let entryStart = cursor
             let propCode = data.readUInt16LE(at: cursor)
             let dataType = data.readUInt16LE(at: cursor + 2)
             let getSet   = data[data.startIndex + cursor + 4]
@@ -2070,11 +2143,16 @@ private extension SonyPTPIPClient {
 
             guard let defaultBytes = readPTPValueBytes(from: data, dataType: dataType, cursor: &cursor),
                   let currentBytes = readPTPValueBytes(from: data, dataType: dataType, cursor: &cursor) else {
+                let sample = data.subdata(in: entryStart..<min(entryStart + 14, data.count)).hexString
+                stopReason = String(format: "val#\(idx)@\(entryStart) 0x%04X dt=0x%04X [%@]", propCode, dataType, sample)
                 break
             }
 
-            // 读取 FormFlag (严格越界保护，避免历史 CVE-2026-40338/40339 同类越界读)
-            guard cursor < data.count else { break }
+            // 读取 FormFlag (严格越界保护)
+            guard cursor < data.count else {
+                stopReason = "ff-eof#\(idx)@\(cursor)"
+                break
+            }
             let formFlag = data[data.startIndex + cursor]
             cursor += 1
 
@@ -2091,39 +2169,49 @@ private extension SonyPTPIPClient {
                 guard skipPTPValue(in: data, dataType: dataType, cursor: &cursor),
                       skipPTPValue(in: data, dataType: dataType, cursor: &cursor),
                       skipPTPValue(in: data, dataType: dataType, cursor: &cursor) else {
-                    return result
+                    stopReason = String(format: "rng#\(idx)@\(entryStart) 0x%04X dt=0x%04X", propCode, dataType)
+                    return ExtPropParseOutcome(properties: result, declaredCount: totalCount, isSDI3: isSDI3, stopReason: stopReason)
                 }
 
             case 0x02:
                 // Enumeration List 1 (全部支持值): UInt16 Count + N × Value
-                guard cursor + 2 <= data.count else { return result }
+                guard cursor + 2 <= data.count else {
+                    stopReason = String(format: "e1len#\(idx)@\(cursor) 0x%04X", propCode)
+                    return ExtPropParseOutcome(properties: result, declaredCount: totalCount, isSDI3: isSDI3, stopReason: stopReason)
+                }
                 let count1 = Int(data.readUInt16LE(at: cursor))
                 cursor += 2
-                supportedList.reserveCapacity(count1)
+                supportedList.reserveCapacity(min(count1, 512))
                 for _ in 0..<count1 {
                     guard let valBytes = readPTPValueBytes(from: data, dataType: dataType, cursor: &cursor) else {
-                        return result
+                        stopReason = String(format: "e1val#\(idx)@\(cursor) 0x%04X c1=\(count1)", propCode)
+                        return ExtPropParseOutcome(properties: result, declaredCount: totalCount, isSDI3: isSDI3, stopReason: stopReason)
                     }
                     supportedList.append(valBytes)
                 }
 
                 // Sony SDI3 (A6700 / BIONZ XR, 0x012C) 紧跟第二张枚举表 (当前档位/当前镜头焦段实际可选值列表)
                 if isSDI3 {
-                    guard cursor + 2 <= data.count else { return result }
+                    guard cursor + 2 <= data.count else {
+                        stopReason = String(format: "e2len#\(idx)@\(cursor) 0x%04X", propCode)
+                        return ExtPropParseOutcome(properties: result, declaredCount: totalCount, isSDI3: isSDI3, stopReason: stopReason)
+                    }
                     let count2 = Int(data.readUInt16LE(at: cursor))
                     cursor += 2
-                    settableList.reserveCapacity(count2)
+                    settableList.reserveCapacity(min(count2, 512))
                     for _ in 0..<count2 {
                         guard let valBytes = readPTPValueBytes(from: data, dataType: dataType, cursor: &cursor) else {
-                            return result
+                            stopReason = String(format: "e2val#\(idx)@\(cursor) 0x%04X c2=\(count2)", propCode)
+                            return ExtPropParseOutcome(properties: result, declaredCount: totalCount, isSDI3: isSDI3, stopReason: stopReason)
                         }
                         settableList.append(valBytes)
                     }
                 }
 
             default:
-                // 遇到未知 FormFlag，无法确定后续偏移，安全终止解析并返回已成功解析的属性
-                return result
+                let sample = data.subdata(in: entryStart..<min(entryStart + 18, data.count)).hexString
+                stopReason = String(format: "ff=0x%02X#\(idx)@\(entryStart) 0x%04X dt=0x%04X [%@]", formFlag, propCode, dataType, sample)
+                return ExtPropParseOutcome(properties: result, declaredCount: totalCount, isSDI3: isSDI3, stopReason: stopReason)
             }
 
             result[propCode] = SonyDevicePropertyDescriptor(
@@ -2138,7 +2226,7 @@ private extension SonyPTPIPClient {
             )
         }
 
-        return result
+        return ExtPropParseOutcome(properties: result, declaredCount: totalCount, isSDI3: isSDI3, stopReason: stopReason)
     }
 
     /// 根据 PTP DataType 读取并推进游标，返回原始字节切片

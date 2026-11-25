@@ -235,6 +235,7 @@ public final class MonitorViewModel {
     public var currentFPS: Int = 0
     public var currentResolutionLabel: String = ""
     public var currentFrameKB: Int = 0
+    public var ptpDiagnosticText: String = ""
     public var statusBannerMessage: String?
 
     // --- 相机实时遥测参数 (A6700) ---
@@ -396,6 +397,7 @@ public final class MonitorViewModel {
         currentFPS = 0
         currentResolutionLabel = ""
         currentFrameKB = 0
+        ptpDiagnosticText = ""
         shutterPresets = Self.fallbackShutterPresets
         isShutterWritable = true
         aperturePresets = Self.fallbackAperturePresets
@@ -482,9 +484,12 @@ public final class MonitorViewModel {
             self.isCameraConnected = true
             showBanner("已连接 \(session.cameraName.isEmpty ? "Sony A6700" : session.cameraName)")
 
-            // 同步首帧状态
-            if let snapshot = try? await client.fetchCameraState() {
+            // 同步首帧状态（记录诊断信息，不再静默吞掉 0x9209 错误）
+            do {
+                let snapshot = try await client.fetchCameraState()
                 applySnapshot(snapshot)
+            } catch {
+                self.ptpDiagnosticText = "0x9209 失败: \(error.localizedDescription)"
             }
 
             // 启动周期遥测同步与延迟测量 (每 2 秒同步一次)
@@ -494,13 +499,16 @@ public final class MonitorViewModel {
                     try? await Task.sleep(for: .seconds(2))
                     guard !Task.isCancelled, let self, let activeClient = self.ptpClient else { break }
                     let t0 = clock.now
-                    if let snap = try? await activeClient.fetchCameraState() {
+                    do {
+                        let snap = try await activeClient.fetchCameraState()
                         let rtt = t0.duration(to: clock.now)
                         let rttMs = Int(rtt.components.seconds * 1000) + Int(rtt.components.attoseconds / 1_000_000_000_000_000)
                         self.applySnapshot(snap)
                         if !self.isUVCActive {
                             self.signalLatencyMs = max(1, rttMs)
                         }
+                    } catch {
+                        self.ptpDiagnosticText = "0x9209 轮询异常: \(error.localizedDescription)"
                     }
                 }
             }
@@ -552,28 +560,36 @@ public final class MonitorViewModel {
     }
 
     private func applySnapshot(_ snap: CameraStateSnapshot) {
+        ptpDiagnosticText = snap.diagnosticSummary
+
         if let shutter = snap.shutterSpeed { currentShutter = shutter }
-        isShutterWritable = snap.isShutterWritable
-        if !snap.availableShutterSpeeds.isEmpty {
-            shutterPresets = snap.availableShutterSpeeds
-        } else if !snap.isShutterWritable {
-            shutterPresets = []
+        if let writable = snap.isShutterWritable {
+            isShutterWritable = writable
+            if !snap.availableShutterSpeeds.isEmpty {
+                shutterPresets = snap.availableShutterSpeeds
+            } else if !writable {
+                shutterPresets = []
+            }
         }
 
         if let aperture = snap.aperture { currentAperture = aperture }
-        isApertureWritable = snap.isApertureWritable
-        if !snap.availableApertures.isEmpty {
-            aperturePresets = snap.availableApertures
-        } else if !snap.isApertureWritable {
-            aperturePresets = []
+        if let writable = snap.isApertureWritable {
+            isApertureWritable = writable
+            if !snap.availableApertures.isEmpty {
+                aperturePresets = snap.availableApertures
+            } else if !writable {
+                aperturePresets = []
+            }
         }
 
         if let iso = snap.iso { currentISO = iso }
-        isISOWritable = snap.isISOWritable
-        if !snap.availableISOs.isEmpty {
-            isoPresets = snap.availableISOs
-        } else if !snap.isISOWritable {
-            isoPresets = []
+        if let writable = snap.isISOWritable {
+            isISOWritable = writable
+            if !snap.availableISOs.isEmpty {
+                isoPresets = snap.availableISOs
+            } else if !writable {
+                isoPresets = []
+            }
         }
         if let wb = snap.whiteBalance { currentWhiteBalance = wb }
         if let k = snap.colorTemperature, k >= 2500, k <= 9900 { currentColorTemp = k }
@@ -2411,6 +2427,12 @@ private struct ConnectionSettingsSheet: View {
                             Text("清晰优先 (High)").tag(SonyLiveViewImageQuality.high)
                         }
                         .pickerStyle(.segmented)
+
+                        if !vm.ptpDiagnosticText.isEmpty {
+                            Text(vm.ptpDiagnosticText)
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                        }
                     }
                 }
 
