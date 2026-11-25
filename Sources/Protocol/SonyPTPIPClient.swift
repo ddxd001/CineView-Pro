@@ -521,6 +521,10 @@ public struct SonyDevicePropertyDescriptor: Sendable {
         activeEnumValuesBytes.compactMap { $0.count >= 2 ? $0.readUInt16LE(at: 0) : nil }
     }
 
+    public var uint32EnumValues: [UInt32] {
+        activeEnumValuesBytes.compactMap { $0.count >= 4 ? $0.readUInt32LE(at: 0) : nil }
+    }
+
     public var uint8Value: UInt8? {
         currentValueBytes.count >= 1 ? currentValueBytes[currentValueBytes.startIndex] : nil
     }
@@ -544,7 +548,13 @@ public struct SonyDevicePropertyDescriptor: Sendable {
 /// 相机常用曝光与状态快照
 public struct CameraStateSnapshot: Sendable {
     public let iso: SonyISOValue?
+    /// 当前机身/图像配置（如 S-Log3 最低原生 ISO 800）下实际可用的 ISO 列表 (来自 0x9209 属性 0xD21E)
+    public let availableISOs: [SonyISOValue]
+    public let isISOWritable: Bool
     public let shutterSpeed: SonyShutterSpeed?
+    /// 当前拍摄模式（如视频 24p/60p 档位）下实际可用的快门速度列表 (来自 0x9209 属性 0xD20D)
+    public let availableShutterSpeeds: [SonyShutterSpeed]
+    public let isShutterWritable: Bool
     public let aperture: SonyAperture?
     /// 当前挂载镜头在当前焦段下实际支持调节的全部光圈档位 (来自 0x9209 属性 0x5007 动态枚举表)
     public let availableApertures: [SonyAperture]
@@ -1339,8 +1349,28 @@ public actor SonyPTPIPClient {
         let props = Self.parseAllExtDevicePropInfo(resp.data, isSDI3: isSDI3)
         self.latestProperties = props
 
-        let iso = props[SonyPTPPropCode.isoSensitivity.rawValue]?.uint32Value.map(SonyISOValue.init(wireValue:))
-        let shutter = props[SonyPTPPropCode.shutterSpeed.rawValue]?.uint32Value.map(SonyShutterSpeed.init(wireValue:))
+        let isoDesc = props[SonyPTPPropCode.isoSensitivity.rawValue]
+        let iso = isoDesc?.uint32Value.map(SonyISOValue.init(wireValue:))
+        let availableISOs: [SonyISOValue] = {
+            guard let desc = isoDesc else { return [] }
+            var seen = Set<UInt32>()
+            return desc.uint32EnumValues
+                .filter { $0 != 0 && seen.insert($0).inserted }
+                .map(SonyISOValue.init(wireValue:))
+        }()
+        let isISOWritable = (isoDesc?.getSet == 0x01) && (isoDesc?.isEnabled == 0x01)
+
+        let shutterDesc = props[SonyPTPPropCode.shutterSpeed.rawValue]
+        let shutter = shutterDesc?.uint32Value.map(SonyShutterSpeed.init(wireValue:))
+        let availableShutterSpeeds: [SonyShutterSpeed] = {
+            guard let desc = shutterDesc else { return [] }
+            var seen = Set<UInt32>()
+            return desc.uint32EnumValues
+                .filter { seen.insert($0).inserted }
+                .map(SonyShutterSpeed.init(wireValue:))
+        }()
+        let isShutterWritable = (shutterDesc?.getSet == 0x01) && (shutterDesc?.isEnabled == 0x01)
+
         let apertureDesc = props[SonyPTPPropCode.fNumber.rawValue]
         let aperture = apertureDesc?.uint16Value.map(SonyAperture.init(rawValue:))
         let availableApertures: [SonyAperture] = {
@@ -1360,7 +1390,11 @@ public actor SonyPTPIPClient {
 
         return CameraStateSnapshot(
             iso: iso,
+            availableISOs: availableISOs,
+            isISOWritable: isISOWritable,
             shutterSpeed: shutter,
+            availableShutterSpeeds: availableShutterSpeeds,
+            isShutterWritable: isShutterWritable,
             aperture: aperture,
             availableApertures: availableApertures,
             isApertureWritable: isApertureWritable,

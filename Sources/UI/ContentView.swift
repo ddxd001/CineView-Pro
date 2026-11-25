@@ -239,9 +239,11 @@ public final class MonitorViewModel {
 
     // --- 相机实时遥测参数 (A6700) ---
     public var currentShutter: SonyShutterSpeed = .fraction(1, 50)
+    public var isShutterWritable: Bool = true
     public var currentAperture: SonyAperture = SonyAperture(fStop: 2.8)
     public var isApertureWritable: Bool = true
     public var currentISO: SonyISOValue = .manual(800)
+    public var isISOWritable: Bool = true
     public var currentExposureBias: SonyExposureBias = SonyExposureBias(rawMilliEV: 0)
     public var currentWhiteBalance: SonyWhiteBalance = .daylight
     public var currentColorTemp: UInt16 = 5600
@@ -288,8 +290,8 @@ public final class MonitorViewModel {
         public var id: String { rawValue }
     }
 
-    // 常用电影机/A6700 快捷挡位表（底部滚轮选项）
-    public let shutterPresets: [SonyShutterSpeed] = [
+    // 离线/仿真模式默认快捷挡位表；联机后由 A6700 0x9209 动态枚举表实时替换
+    private static let fallbackShutterPresets: [SonyShutterSpeed] = [
         .fraction(1, 24), .fraction(1, 25), .fraction(1, 30), .fraction(1, 48),
         .fraction(1, 50), .fraction(1, 60), .fraction(1, 100), .fraction(1, 120),
         .fraction(1, 125), .fraction(1, 200), .fraction(1, 250), .fraction(1, 500),
@@ -300,14 +302,20 @@ public final class MonitorViewModel {
         1.4, 1.8, 2.0, 2.2, 2.5, 2.8, 3.2, 3.5, 4.0, 4.5, 5.0, 5.6, 6.3, 7.1, 8.0, 9.0, 11.0, 13.0, 16.0
     ].map(SonyAperture.init(fStop:))
 
-    /// 动态光圈候选表：联机后严格只展示当前镜头在当前焦段支持的光圈值 (来自 0x9209 属性 0x5007)
-    public var aperturePresets: [SonyAperture] = MonitorViewModel.fallbackAperturePresets
-
-    public let isoPresets: [SonyISOValue] = [
+    private static let fallbackISOPresets: [SonyISOValue] = [
         .auto, .manual(100), .manual(160), .manual(200), .manual(320), .manual(400),
         .manual(640), .manual(800), .manual(1250), .manual(1600), .manual(2500),
         .manual(3200), .manual(6400), .manual(12800), .manual(25600)
     ]
+
+    /// 动态快门候选表：联机后严格同步 A6700 当前拍摄模式可用的快门档位 (来自 0x9209 属性 0xD20D)
+    public var shutterPresets: [SonyShutterSpeed] = MonitorViewModel.fallbackShutterPresets
+
+    /// 动态光圈候选表：联机后严格只展示当前镜头在当前焦段支持的光圈值 (来自 0x9209 属性 0x5007)
+    public var aperturePresets: [SonyAperture] = MonitorViewModel.fallbackAperturePresets
+
+    /// 动态 ISO 候选表：联机后严格同步 A6700 当前图像配置（如 S-Log3）下可用的 ISO 档位 (来自 0x9209 属性 0xD21E)
+    public var isoPresets: [SonyISOValue] = MonitorViewModel.fallbackISOPresets
 
     public let exposureBiasPresets: [SonyExposureBias] = SonyExposureBias.standardThirdStopPresets
 
@@ -388,8 +396,12 @@ public final class MonitorViewModel {
         currentFPS = 0
         currentResolutionLabel = ""
         currentFrameKB = 0
+        shutterPresets = Self.fallbackShutterPresets
+        isShutterWritable = true
         aperturePresets = Self.fallbackAperturePresets
         isApertureWritable = true
+        isoPresets = Self.fallbackISOPresets
+        isISOWritable = true
     }
 
     /// 启动内置动态 SMPTE 彩条 + 0-100 IRE 斜坡 + 西门子对焦标板测试信号（模拟器离线仿真专用）
@@ -541,6 +553,13 @@ public final class MonitorViewModel {
 
     private func applySnapshot(_ snap: CameraStateSnapshot) {
         if let shutter = snap.shutterSpeed { currentShutter = shutter }
+        isShutterWritable = snap.isShutterWritable
+        if !snap.availableShutterSpeeds.isEmpty {
+            shutterPresets = snap.availableShutterSpeeds
+        } else if !snap.isShutterWritable {
+            shutterPresets = []
+        }
+
         if let aperture = snap.aperture { currentAperture = aperture }
         isApertureWritable = snap.isApertureWritable
         if !snap.availableApertures.isEmpty {
@@ -548,7 +567,14 @@ public final class MonitorViewModel {
         } else if !snap.isApertureWritable {
             aperturePresets = []
         }
+
         if let iso = snap.iso { currentISO = iso }
+        isISOWritable = snap.isISOWritable
+        if !snap.availableISOs.isEmpty {
+            isoPresets = snap.availableISOs
+        } else if !snap.isISOWritable {
+            isoPresets = []
+        }
         if let wb = snap.whiteBalance { currentWhiteBalance = wb }
         if let k = snap.colorTemperature, k >= 2500, k <= 9900 { currentColorTemp = k }
         if let ev = snap.exposureBias { currentExposureBias = ev }
@@ -1576,12 +1602,19 @@ public struct ContentView: View {
                 HStack(spacing: 8) {
                     switch control {
                     case .shutter:
-                        ForEach(vm.shutterPresets, id: \.self) { preset in
-                            wheelChip(
-                                title: preset.description,
-                                isSelected: vm.currentShutter == preset
-                            ) {
-                                vm.setShutter(preset)
+                        if vm.isCameraConnected && (!vm.isShutterWritable || vm.shutterPresets.isEmpty) {
+                            Text("当前拍摄模式不支持手动调节快门（请切至 S / M 模式）")
+                                .font(.system(size: 11))
+                                .foregroundStyle(.white.opacity(0.65))
+                                .padding(.vertical, 6)
+                        } else {
+                            ForEach(vm.shutterPresets, id: \.self) { preset in
+                                wheelChip(
+                                    title: preset.description,
+                                    isSelected: vm.currentShutter == preset
+                                ) {
+                                    vm.setShutter(preset)
+                                }
                             }
                         }
 
@@ -1603,12 +1636,19 @@ public struct ContentView: View {
                         }
 
                     case .iso:
-                        ForEach(vm.isoPresets, id: \.self) { preset in
-                            wheelChip(
-                                title: preset.description.replacingOccurrences(of: "ISO ", with: ""),
-                                isSelected: vm.currentISO == preset
-                            ) {
-                                vm.setISO(preset)
+                        if vm.isCameraConnected && (!vm.isISOWritable || vm.isoPresets.isEmpty) {
+                            Text("当前拍摄模式或机身设置不支持手动调节 ISO")
+                                .font(.system(size: 11))
+                                .foregroundStyle(.white.opacity(0.65))
+                                .padding(.vertical, 6)
+                        } else {
+                            ForEach(vm.isoPresets, id: \.self) { preset in
+                                wheelChip(
+                                    title: preset.description.replacingOccurrences(of: "ISO ", with: ""),
+                                    isSelected: vm.currentISO == preset
+                                ) {
+                                    vm.setISO(preset)
+                                }
                             }
                         }
 
