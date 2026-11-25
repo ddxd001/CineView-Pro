@@ -110,6 +110,16 @@ public enum ActiveExposureControl: String, Sendable, Identifiable {
         case .whiteBalance: return "白平衡 & 色温 (0x5005 / 0xD20F)"
         }
     }
+
+    public var shortTitle: String {
+        switch self {
+        case .shutter:      return "SS"
+        case .aperture:     return "F"
+        case .iso:          return "ISO"
+        case .exposureBias: return "EV"
+        case .whiteBalance: return "WB"
+        }
+    }
 }
 
 /// 示波器浮窗展示模式
@@ -268,11 +278,51 @@ public final class MonitorViewModel {
 
     // --- 界面交互状态 ---
     public var activeExposureControl: ActiveExposureControl?
-    public var activeToolInspector: ToolInspectorKind?
     public var focusReticle: FocusReticleState?
-    public var isConnectionSheetPresented: Bool = false
+    public var isSettingsDrawerPresented: Bool = false
+    public var settingsDrawerTab: SettingsDrawerTab = .assist
+    public var isGalleryPresented: Bool = false
     public var isLUTImporterPresented: Bool = false
     public var isHUDHidden: Bool = false
+
+    // --- 刚拍照片缓存相册 (0xFFFFC001) ---
+    public var capturedPhotos: [CapturedPhotoItem] = []
+    public var hasUnreadCapturedPhoto: Bool = false
+    public var isFetchingCapturedPhoto: Bool = false
+
+    public func openSettings(tab: SettingsDrawerTab) {
+        settingsDrawerTab = tab
+        withAnimation(.snappy(duration: 0.22)) {
+            activeExposureControl = nil
+            isGalleryPresented = false
+            isSettingsDrawerPresented = true
+        }
+    }
+
+    public func closeSettings() {
+        withAnimation(.snappy(duration: 0.2)) {
+            isSettingsDrawerPresented = false
+        }
+    }
+
+    public func openGallery() {
+        hasUnreadCapturedPhoto = false
+        withAnimation(.snappy(duration: 0.22)) {
+            activeExposureControl = nil
+            isSettingsDrawerPresented = false
+            isGalleryPresented = true
+        }
+        // 打开相册时若相机已连且暂未拉取到照片，顺手静默探测一次 0xFFFFC001
+        if isCameraConnected && !isFetchingCapturedPhoto {
+            Task { await pullCapturedPhotoFromCamera(manual: false) }
+        }
+    }
+
+    public func closeGallery() {
+        withAnimation(.snappy(duration: 0.2)) {
+            isGalleryPresented = false
+        }
+    }
 
     // --- 内部后台任务 ---
     private var liveViewTask: Task<Void, Never>?
@@ -284,15 +334,6 @@ public final class MonitorViewModel {
     private var bannerDismissTask: Task<Void, Never>?
 
     private let logger = Logger(subsystem: "com.cineviewpro.ui", category: "MonitorViewModel")
-
-    public enum ToolInspectorKind: String, Sendable, Identifiable {
-        case lut
-        case peaking
-        case zebra
-        case guides
-        case flip
-        public var id: String { rawValue }
-    }
 
     // 离线/仿真模式默认快捷挡位表；联机后由 A6700 0x9209 动态枚举表实时替换
     private static let fallbackShutterPresets: [SonyShutterSpeed] = [
@@ -500,13 +541,19 @@ public final class MonitorViewModel {
                 self.ptpDiagnosticText = "0x9209 失败: \(error.localizedDescription)"
             }
 
-            // 监听 Sony Event 通道 (0xC203 属性变更 / 0xC21B 镜头变更 / 0x4006)，物理拨轮转动后 120ms 内即时同步
+            // 监听 Sony Event 通道 (0xC203 属性变更 / 0xC21B 镜头变更 / 0x4006 / 0xC201 & 0x4002 新拍照片就绪)
             eventSyncTask = Task { [weak self] in
                 let stream = await client.events()
                 for await event in stream {
                     guard !Task.isCancelled, let self else { break }
                     let code = event.eventCode
-                    if code == SonyPTPEventCode.sonyDevicePropChanged.rawValue
+                    if code == SonyPTPEventCode.sonyObjectAdded.rawValue
+                        || code == SonyPTPEventCode.objectAdded.rawValue {
+                        let handle = event.parameters.first ?? SonyVirtualObjectHandle.capturedImage.rawValue
+                        Task { @MainActor [weak self] in
+                            await self?.pullCapturedPhotoFromCamera(handle: handle, manual: false)
+                        }
+                    } else if code == SonyPTPEventCode.sonyDevicePropChanged.rawValue
                         || code == SonyPTPEventCode.sonyLensInformationChanged.rawValue
                         || code == SonyPTPEventCode.devicePropChanged.rawValue {
                         self.scheduleDebouncedStateSync(delayMs: 120)
@@ -661,6 +708,16 @@ public final class MonitorViewModel {
         if snap.isRecording != isRecording {
             isRecording = snap.isRecording
             updateRecordingTimer(active: isRecording)
+        }
+
+        // 兜底检测 ObjectInMemory (0xD215 >= 0x8000)：即使错过 0xC201 事件也能自动拉取刚拍照片
+        if let inMem = snap.objectInMemory, inMem >= 0x8000, !isFetchingCapturedPhoto {
+            Task { @MainActor [weak self] in
+                await self?.pullCapturedPhotoFromCamera(
+                    handle: SonyVirtualObjectHandle.capturedImage.rawValue,
+                    manual: false
+                )
+            }
         }
     }
 
@@ -918,6 +975,128 @@ public final class MonitorViewModel {
         return String(format: "%02d:%02d:%02d", hrs, mins, secs)
     }
 
+    // MARK: - 刚拍照片自动拉取与本地缓存管理 (PTP 0xFFFFC001)
+
+    public func pullCapturedPhotoFromCamera(
+        handle: UInt32 = SonyVirtualObjectHandle.capturedImage.rawValue,
+        manual: Bool = false
+    ) async {
+        guard !isFetchingCapturedPhoto else { return }
+        guard let client = ptpClient else {
+            if manual {
+                showBanner("未连接相机 PTP 通道，无法拉取照片")
+            }
+            return
+        }
+
+        isFetchingCapturedPhoto = true
+        defer { isFetchingCapturedPhoto = false }
+
+        do {
+            guard let captured = try await client.fetchCapturedPhoto(handle: handle) else {
+                if manual {
+                    showBanner("相机缓冲区暂无新拍照片（请确认保存目的地含 PC）")
+                }
+                return
+            }
+
+            // 后台线程通过 ImageIO 高效解码 2048px 预览图与缩略图，避免卡顿 60fps 监看
+            let decoded: CapturedPhotoItem? = await Task.detached(priority: .userInitiated) {
+                CapturedPhotoItem.decode(from: captured)
+            }.value
+
+            guard let item = decoded else {
+                if manual {
+                    showBanner("照片格式解码失败 (\(captured.info.formatDisplayName))")
+                }
+                return
+            }
+
+            capturedPhotos.insert(item, at: 0)
+            // 最多保留最近 30 张刚拍照片，超出时自动清理最早的临时缓存文件
+            while capturedPhotos.count > 30 {
+                let removed = capturedPhotos.removeLast()
+                if let url = removed.fileURL {
+                    try? FileManager.default.removeItem(at: url)
+                }
+            }
+
+            if !isGalleryPresented {
+                hasUnreadCapturedPhoto = true
+                showBanner("已接收新照片 \(item.filename)")
+            }
+        } catch {
+            if manual {
+                showBanner("照片拉取失败: \(error.localizedDescription)")
+            } else {
+                logger.warning("自动拉取刚拍照片失败: \(error.localizedDescription, privacy: .public)")
+            }
+        }
+    }
+
+    public func deleteCapturedPhoto(_ item: CapturedPhotoItem) {
+        capturedPhotos.removeAll { $0.id == item.id }
+        if let url = item.fileURL {
+            try? FileManager.default.removeItem(at: url)
+        }
+    }
+
+    /// 仿真测试模式下生成一张测试照片，便于离线体验相册预览与缩放交互
+    public func captureSimulatedTestPhoto() {
+        let size = CGSize(width: 1280, height: 854)
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1.0
+        let renderer = UIGraphicsImageRenderer(size: size, format: format)
+        let image = renderer.image { ctx in
+            let colors: [UIColor] = [
+                UIColor(red: 0.75, green: 0.75, blue: 0.75, alpha: 1),
+                UIColor(red: 0.75, green: 0.75, blue: 0.0, alpha: 1),
+                UIColor(red: 0.0, green: 0.75, blue: 0.75, alpha: 1),
+                UIColor(red: 0.0, green: 0.75, blue: 0.0, alpha: 1),
+                UIColor(red: 0.75, green: 0.0, blue: 0.75, alpha: 1),
+                UIColor(red: 0.75, green: 0.0, blue: 0.0, alpha: 1),
+                UIColor(red: 0.0, green: 0.0, blue: 0.75, alpha: 1)
+            ]
+            let barW = size.width / CGFloat(colors.count)
+            for (idx, col) in colors.enumerated() {
+                col.setFill()
+                ctx.fill(CGRect(x: CGFloat(idx) * barW, y: 0, width: barW + 1, height: size.height * 0.72))
+            }
+            UIColor(white: 0.12, alpha: 1).setFill()
+            ctx.fill(CGRect(x: 0, y: size.height * 0.72, width: size.width, height: size.height * 0.28))
+
+            let title = "CineView Pro · Test Capture #\(capturedPhotos.count + 1)" as NSString
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: RobotoFlexFont.uiFont(size: 38, weight: 700),
+                .foregroundColor: UIColor.white
+            ]
+            let textSize = title.size(withAttributes: attrs)
+            title.draw(
+                at: CGPoint(x: (size.width - textSize.width) * 0.5, y: size.height * 0.82),
+                withAttributes: attrs
+            )
+        }
+
+        guard let jpegData = image.jpegData(compressionQuality: 0.9) else { return }
+        let idx = capturedPhotos.count + 1
+        let info = SonyCapturedObjectInfo(
+            handle: SonyVirtualObjectHandle.capturedImage.rawValue,
+            storageID: 0,
+            objectFormat: 0x3801,
+            compressedSize: UInt32(jpegData.count),
+            thumbFormat: 0,
+            thumbCompressedSize: 0,
+            imageWidth: UInt32(size.width),
+            imageHeight: UInt32(size.height),
+            filename: String(format: "SIM_%04d.JPG", idx),
+            captureDate: ""
+        )
+        let captured = SonyCapturedPhoto(info: info, imageData: jpegData, thumbnailData: nil)
+        if let item = CapturedPhotoItem.decode(from: captured) {
+            capturedPhotos.insert(item, at: 0)
+        }
+    }
+
     public func showBanner(_ text: String) {
         statusBannerMessage = text
         bannerDismissTask?.cancel()
@@ -944,7 +1123,7 @@ public final class MonitorViewModel {
 
 // MARK: - 5. MTKView SwiftUI 桥接封装
 
-private struct MonitorMetalView: UIViewRepresentable {
+struct MonitorMetalView: UIViewRepresentable {
     let renderer: MonitorRenderer?
 
     func makeUIView(context: Context) -> MTKView {
@@ -963,1224 +1142,39 @@ private struct MonitorMetalView: UIViewRepresentable {
     }
 }
 
-// MARK: - 6. 主界面 ContentView (Monitor+ 极简专业横屏监视器)
+// MARK: - 6. 主界面 ContentView (双侧边栏零遮挡极简横屏监视器)
 
 public struct ContentView: View {
     @State private var vm = MonitorViewModel()
 
-    // 视频缩放与拖动状态
-    @State private var zoomScale: CGFloat = 1.0
-    @State private var gestureZoomScale: CGFloat = 1.0
-    @State private var panOffset: CGSize = .zero
-    @State private var gesturePanOffset: CGSize = .zero
-
-    // 可拖动示波器浮窗偏移
-    @State private var scopesDragOffset: CGSize = .zero
-    @State private var scopesGestureOffset: CGSize = .zero
-
     public init() {}
 
-    private var effectiveZoom: CGFloat {
-        min(max(zoomScale * gestureZoomScale, 1.0), 4.0)
-    }
-
-    private var effectivePan: CGSize {
-        CGSize(
-            width: panOffset.width + gesturePanOffset.width,
-            height: panOffset.height + gesturePanOffset.height
-        )
-    }
-
     public var body: some View {
-        GeometryReader { geo in
-            ZStack {
-                Color.black.ignoresSafeArea()
-
-                // ---------------------------------------------------------
-                // LAYER 0: 全屏 60fps MTKView 视频画面 + 安全框 + 缩放/拖动/触控对焦手势
-                // ---------------------------------------------------------
-                videoCanvasLayer(containerSize: geo.size)
-
-                // 假色 12 段 IRE 色标尺（仅开启假色时显示在最左侧，不遮挡构图）
-                if vm.renderSettings.isFalseColorEnabled && !vm.isHUDHidden {
-                    HStack {
-                        FalseColorLegendBar()
-                            .padding(.leading, 14)
-                        Spacer()
-                    }
-                    .allowsHitTesting(false)
-                    .transition(.opacity)
-                }
-
-                // 触控对焦角标框动画
-                if let reticle = vm.focusReticle {
-                    FocusReticleView(isLocked: reticle.isLocked)
-                        .position(reticle.screenPoint)
-                        .allowsHitTesting(false)
-                }
-
-                // ---------------------------------------------------------
-                // LAYER 1: 可拖动实时波形图 / RGB 直方图浮窗
-                // ---------------------------------------------------------
-                if vm.isScopesVisible && !vm.isHUDHidden {
-                    VStack {
-                        Spacer()
-                        HStack {
-                            ScopesFloatingWidget(
-                                scope: vm.latestScope,
-                                mode: $vm.scopeDisplayMode,
-                                applyLUT: Binding(
-                                    get: { vm.renderSettings.scopesApplyLUT },
-                                    set: { vm.renderSettings.scopesApplyLUT = $0 }
-                                ),
-                                onClose: { withAnimation(.snappy) { vm.isScopesVisible = false } }
-                            )
-                            .offset(
-                                x: scopesDragOffset.width + scopesGestureOffset.width,
-                                y: scopesDragOffset.height + scopesGestureOffset.height
-                            )
-                            .gesture(
-                                DragGesture()
-                                    .onChanged { value in
-                                        scopesGestureOffset = value.translation
-                                    }
-                                    .onEnded { value in
-                                        scopesDragOffset.width += value.translation.width
-                                        scopesDragOffset.height += value.translation.height
-                                        scopesGestureOffset = .zero
-                                    }
-                            )
-                            Spacer()
-                        }
-                        .padding(.leading, 16)
-                        .padding(.bottom, vm.activeExposureControl != nil || vm.activeToolInspector != nil ? 108 : 56)
-                    }
-                    .transition(.scale(scale: 0.92).combined(with: .opacity))
-                }
-
-                // ---------------------------------------------------------
-                // LAYER 2: 顶部悬浮状态栏 + 右侧专业工具栏 + 左下角档位徽标 + 底部快捷滚轮/子菜单
-                // ---------------------------------------------------------
-                if !vm.isHUDHidden {
-                    VStack(spacing: 0) {
-                        topStatusBar
-                            .padding(.horizontal, 16)
-                            .padding(.top, 10)
-
-                        // 状态提示吐司
-                        if let msg = vm.statusBannerMessage {
-                            Text(msg)
-                                .font(.system(size: 11, weight: .medium, design: .monospaced))
-                                .foregroundStyle(.white)
-                                .padding(.horizontal, 12)
-                                .padding(.vertical, 5)
-                                .background(.black.opacity(0.75), in: Capsule())
-                                .overlay(Capsule().stroke(.white.opacity(0.18), lineWidth: 0.5))
-                                .padding(.top, 6)
-                                .transition(.move(edge: .top).combined(with: .opacity))
-                        }
-
-                        Spacer()
-
-                        // 底部弹出区：曝光快捷滚轮 或 辅助工具细调面板
-                        bottomContextualDrawer
-                            .padding(.bottom, 12)
-                    }
-
-                    // 左下角：当前机身曝光档位徽标 (A / S / M / P / AUTO / MOVIE M / S&Q 等)
-                    VStack {
-                        Spacer()
-                        HStack {
-                            bottomLeftExposureModeBadge
-                            Spacer()
-                        }
-                        .padding(.leading, 18)
-                        .padding(.bottom, vm.activeExposureControl != nil || vm.activeToolInspector != nil ? 98 : 16)
-                    }
-                    .animation(.snappy(duration: 0.2), value: vm.activeExposureControl != nil || vm.activeToolInspector != nil)
-
-                    // 右侧悬浮垂直工具栏
-                    HStack {
-                        Spacer()
-                        rightFloatingToolbar
-                            .padding(.trailing, 14)
-                    }
-                }
-
-                // 缩放倍率微标（放大巡检细节时显示，点击一键复位 1.0x）
-                if effectiveZoom > 1.02 {
-                    VStack {
-                        Spacer()
-                        HStack {
-                            Spacer()
-                            Button {
-                                resetZoomAndPan()
-                            } label: {
-                                HStack(spacing: 5) {
-                                    Image(systemName: "viewfinder")
-                                    Text(String(format: "%.1fx 复位", effectiveZoom))
-                                }
-                                .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                                .foregroundStyle(.black)
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 5)
-                                .background(Color.yellow, in: Capsule())
-                            }
-                            .padding(.trailing, 74)
-                            .padding(.bottom, 16)
-                        }
-                    }
-                    .transition(.opacity)
-                }
-
-                // 无画面待机提示
-                if !vm.isCameraConnected && !vm.isUVCActive && !vm.isTestPatternActive && !vm.isHUDHidden {
-                    standbyOverlay
-                }
+        MonitorWorkspaceView(vm: vm)
+            // 隐藏系统状态栏与底部 Home 指示条，实现全屏无干扰监看
+            .statusBarHidden(true)
+            .persistentSystemOverlays(.hidden)
+            .ignoresSafeArea()
+            .preferredColorScheme(.dark)
+            .onAppear {
+                enforceLandscapeOrientation()
+                UIApplication.shared.isIdleTimerDisabled = true // 监看时保持屏幕常亮
             }
-            .contentShape(Rectangle())
-        }
-        // 隐藏系统状态栏与底部 Home 指示条，真正做到全屏无干扰监看
-        .statusBarHidden(true)
-        .persistentSystemOverlays(.hidden)
-        .ignoresSafeArea()
-        .preferredColorScheme(.dark)
-        .onAppear {
-            enforceLandscapeOrientation()
-            UIApplication.shared.isIdleTimerDisabled = true // 监看时保持屏幕常亮
-        }
-        .onDisappear {
-            UIApplication.shared.isIdleTimerDisabled = false
-            Task { await vm.disconnectAll() }
-        }
-        // 标准 .cube 3D LUT 文件导入器
-        .fileImporter(
-            isPresented: $vm.isLUTImporterPresented,
-            allowedContentTypes: [
-                UTType(filenameExtension: "cube") ?? .data,
-                .data
-            ],
-            allowsMultipleSelection: false
-        ) { result in
-            vm.importCubeLUT(result: result)
-        }
-        // 连接模式设置弹窗
-        .sheet(isPresented: $vm.isConnectionSheetPresented) {
-            ConnectionSettingsSheet(vm: vm)
-                .presentationDetents([.medium])
-                .preferredColorScheme(.dark)
-        }
-    }
-
-    // MARK: - LAYER 0: 全屏视频画布与手势系统
-
-    private func videoCanvasLayer(containerSize: CGSize) -> some View {
-        let videoRect = computeActiveVideoRect(in: containerSize)
-
-        return ZStack {
-            MonitorMetalView(renderer: vm.renderer)
-                .frame(width: containerSize.width, height: containerSize.height)
-
-            // 构图安全框参考线 + 三分九宫格（精准贴合当前有效视频区域）
-            if vm.frameGuide.aspectRatio != nil || vm.isGridEnabled {
-                FrameGuideOverlay(
-                    videoRect: videoRect,
-                    guideAspect: vm.frameGuide.aspectRatio,
-                    showRuleOfThirds: vm.isGridEnabled,
-                    label: vm.frameGuide.rawValue
-                )
-                .allowsHitTesting(false)
+            .onDisappear {
+                UIApplication.shared.isIdleTimerDisabled = false
+                Task { await vm.disconnectAll() }
             }
-        }
-        .scaleEffect(effectiveZoom, anchor: .center)
-        .offset(effectivePan)
-        .frame(width: containerSize.width, height: containerSize.height)
-        .clipped()
-        .contentShape(Rectangle())
-        // 1. 双击复位缩放
-        .highPriorityGesture(
-            TapGesture(count: 2)
-                .onEnded {
-                    if effectiveZoom > 1.02 {
-                        resetZoomAndPan()
-                    } else {
-                        withAnimation(.snappy(duration: 0.25)) {
-                            zoomScale = 2.0
-                        }
-                    }
-                }
-        )
-        // 2. 单击画面精准触控对焦（将屏幕点击坐标反算为未缩放视频画幅内的归一化 [0...1, 0...1]）
-        .simultaneousGesture(
-            SpatialTapGesture(count: 1)
-                .onEnded { value in
-                    // 若当前正打开底部调节抽屉，单击画面优先收起抽屉避免误触对焦
-                    if vm.activeExposureControl != nil || vm.activeToolInspector != nil {
-                        withAnimation(.snappy(duration: 0.2)) {
-                            vm.activeExposureControl = nil
-                            vm.activeToolInspector = nil
-                        }
-                        return
-                    }
-
-                    if let normalized = mapTapToNormalizedFocusPoint(
-                        tapLocation: value.location,
-                        containerSize: containerSize,
-                        videoRect: videoRect
-                    ) {
-                        vm.handleTouchFocus(screenPoint: value.location, normalizedPoint: normalized)
-                    }
-                }
-        )
-        // 3. 双指捏合缩放 (1.0x ... 4.0x)
-        .simultaneousGesture(
-            MagnifyGesture()
-                .onChanged { value in
-                    gestureZoomScale = value.magnification
-                }
-                .onEnded { value in
-                    let finalScale = min(max(zoomScale * value.magnification, 1.0), 4.0)
-                    zoomScale = finalScale
-                    gestureZoomScale = 1.0
-                    if finalScale <= 1.01 {
-                        resetZoomAndPan()
-                    } else {
-                        panOffset = clampedPanOffset(panOffset, scale: finalScale, containerSize: containerSize)
-                    }
-                }
-        )
-        // 4. 放大状态下支持单指拖动巡检焦点与细节
-        .simultaneousGesture(
-            DragGesture(minimumDistance: 6)
-                .onChanged { value in
-                    guard effectiveZoom > 1.02 else { return }
-                    gesturePanOffset = value.translation
-                }
-                .onEnded { value in
-                    guard effectiveZoom > 1.02 else { return }
-                    let proposed = CGSize(
-                        width: panOffset.width + value.translation.width,
-                        height: panOffset.height + value.translation.height
-                    )
-                    panOffset = clampedPanOffset(proposed, scale: zoomScale, containerSize: containerSize)
-                    gesturePanOffset = .zero
-                }
-        )
-    }
-
-    /// 计算与 `MonitorShaders.metal` 完全一致的有效视频矩形 (含变形镜头反挤压倍率)
-    private func computeActiveVideoRect(in containerSize: CGSize) -> CGRect {
-        let src = vm.renderer?.currentSourceSize ?? CGSize(width: 1920, height: 1080)
-        let srcW = max(src.width, 1)
-        let srcH = max(src.height, 1)
-        let effectiveAspect = (srcW / srcH) * CGFloat(max(vm.renderSettings.desqueeze.rawValue, 1.0))
-        let viewportAspect = containerSize.width / max(containerSize.height, 1)
-
-        if viewportAspect > effectiveAspect {
-            // Pillarbox: 左右黑边
-            let videoH = containerSize.height
-            let videoW = videoH * effectiveAspect
-            return CGRect(
-                x: (containerSize.width - videoW) * 0.5,
-                y: 0,
-                width: videoW,
-                height: videoH
-            )
-        } else {
-            // Letterbox: 上下黑边
-            let videoW = containerSize.width
-            let videoH = videoW / effectiveAspect
-            return CGRect(
-                x: 0,
-                y: (containerSize.height - videoH) * 0.5,
-                width: videoW,
-                height: videoH
-            )
-        }
-    }
-
-    /// 将屏幕触摸点反算回 Sony 画面归一化坐标 [0...1, 0...1]
-    private func mapTapToNormalizedFocusPoint(
-        tapLocation: CGPoint,
-        containerSize: CGSize,
-        videoRect: CGRect
-    ) -> TouchFocusPoint? {
-        let cx = containerSize.width * 0.5
-        let cy = containerSize.height * 0.5
-        let scale = max(effectiveZoom, 1.0)
-        let pan = effectivePan
-
-        // 反向撤销 scaleEffect + offset
-        let unzoomedX = (tapLocation.x - cx - pan.width) / scale + cx
-        let unzoomedY = (tapLocation.y - cy - pan.height) / scale + cy
-        let unzoomedPt = CGPoint(x: unzoomedX, y: unzoomedY)
-
-        guard videoRect.contains(unzoomedPt), videoRect.width > 0, videoRect.height > 0 else {
-            return nil
-        }
-
-        var normX = (unzoomedPt.x - videoRect.minX) / videoRect.width
-        var normY = (unzoomedPt.y - videoRect.minY) / videoRect.height
-        // 画面处于水平镜像 / 垂直翻转时，自动同步反向映射触控对焦坐标，确保指哪打哪
-        if vm.renderSettings.flipHorizontal {
-            normX = 1.0 - normX
-        }
-        if vm.renderSettings.flipVertical {
-            normY = 1.0 - normY
-        }
-        return TouchFocusPoint(x: Double(normX), y: Double(normY))
-    }
-
-    private func clampedPanOffset(_ offset: CGSize, scale: CGFloat, containerSize: CGSize) -> CGSize {
-        let maxX = max(0, (containerSize.width * (scale - 1.0)) * 0.5)
-        let maxY = max(0, (containerSize.height * (scale - 1.0)) * 0.5)
-        return CGSize(
-            width: min(max(offset.width, -maxX), maxX),
-            height: min(max(offset.height, -maxY), maxY)
-        )
-    }
-
-    private func resetZoomAndPan() {
-        withAnimation(.snappy(duration: 0.25)) {
-            zoomScale = 1.0
-            gestureZoomScale = 1.0
-            panOffset = .zero
-            gesturePanOffset = .zero
-        }
-    }
-
-    // MARK: - LAYER 2A: 顶部悬浮状态栏 (Monitor+ 极简风格)
-
-    private var topStatusBar: some View {
-        HStack(spacing: 12) {
-            // 左侧：连接模式 + 实时延迟胶囊
-            Button {
-                vm.isConnectionSheetPresented = true
-            } label: {
-                HStack(spacing: 7) {
-                    Circle()
-                        .fill(connectionStatusColor)
-                        .frame(width: 7, height: 7)
-                    Image(systemName: vm.connectionMode.symbolName)
-                        .font(.system(size: 11, weight: .semibold))
-                    Text(vm.isTestPatternActive ? "测试信号" : vm.connectionMode.rawValue)
-                        .font(.system(size: 11, weight: .semibold))
-                    Divider()
-                        .frame(height: 11)
-                        .background(.white.opacity(0.25))
-                    if !vm.currentResolutionLabel.isEmpty {
-                        Text(vm.currentFrameKB > 0 ? "\(vm.currentResolutionLabel) · \(vm.currentFrameKB)KB" : vm.currentResolutionLabel)
-                            .font(.system(size: 10, weight: .medium, design: .monospaced))
-                            .foregroundStyle(.white.opacity(0.75))
-                        Divider()
-                            .frame(height: 11)
-                            .background(.white.opacity(0.25))
-                    }
-                    if vm.currentFPS > 0 {
-                        Text("\(vm.currentFPS) fps")
-                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                            .foregroundStyle(.cyan)
-                        Divider()
-                            .frame(height: 11)
-                            .background(.white.opacity(0.25))
-                    }
-                    Text(vm.signalLatencyMs > 0 ? "\(vm.signalLatencyMs) ms" : "-- ms")
-                        .font(.system(size: 11, weight: .medium, design: .monospaced))
-                        .foregroundStyle(vm.signalLatencyMs > 80 ? .orange : .green)
-                }
-                .foregroundStyle(.white)
-                .padding(.horizontal, 11)
-                .padding(.vertical, 6)
-                .background(.ultraThinMaterial.opacity(0.85), in: Capsule())
-                .overlay(Capsule().stroke(.white.opacity(0.14), lineWidth: 0.5))
+            // 标准 .cube 3D LUT 文件导入器
+            .fileImporter(
+                isPresented: $vm.isLUTImporterPresented,
+                allowedContentTypes: [
+                    UTType(filenameExtension: "cube") ?? .data,
+                    .data
+                ],
+                allowsMultipleSelection: false
+            ) { result in
+                vm.importCubeLUT(result: result)
             }
-            .buttonStyle(.plain)
-
-            Spacer(minLength: 8)
-
-            // 中间：实时曝光参数胶囊 (快门 | 光圈 | ISO | 曝光补偿 | 白平衡/色温)
-            HStack(spacing: 2) {
-                exposurePillCell(
-                    label: "SS",
-                    value: vm.currentShutter.description,
-                    control: .shutter
-                )
-                pillDivider
-                exposurePillCell(
-                    label: "F",
-                    value: vm.currentAperture.description.replacingOccurrences(of: "F", with: ""),
-                    control: .aperture
-                )
-                pillDivider
-                exposurePillCell(
-                    label: "ISO",
-                    value: vm.currentISO.description.replacingOccurrences(of: "ISO ", with: ""),
-                    control: .iso
-                )
-                pillDivider
-                exposurePillCell(
-                    label: "EV",
-                    value: vm.currentExposureBias.description,
-                    control: .exposureBias
-                )
-                pillDivider
-                exposurePillCell(
-                    label: "WB",
-                    value: vm.currentWhiteBalance == .colorTempFilter ? "\(vm.currentColorTemp)K" : vm.currentWhiteBalance.description,
-                    control: .whiteBalance
-                )
-            }
-            .padding(.horizontal, 6)
-            .padding(.vertical, 3)
-            .background(.black.opacity(0.72), in: Capsule())
-            .overlay(Capsule().stroke(.white.opacity(0.16), lineWidth: 0.6))
-
-            Spacer(minLength: 8)
-
-            // 右侧：机身电量 + 录制红点状态 + 快捷录制按钮
-            HStack(spacing: 10) {
-                // 机身电量
-                HStack(spacing: 4) {
-                    Image(systemName: batteryIconName)
-                        .font(.system(size: 12))
-                        .foregroundStyle(vm.batteryPercent <= 20 ? .red : .white.opacity(0.9))
-                    Text("\(vm.batteryPercent)%")
-                        .font(.system(size: 11, weight: .medium, design: .monospaced))
-                        .foregroundStyle(.white.opacity(0.9))
-                }
-
-                Divider()
-                    .frame(height: 12)
-                    .background(.white.opacity(0.25))
-
-                // 录制状态红点 + 时间码 / 录制触发按钮
-                Button {
-                    vm.toggleRecording()
-                } label: {
-                    HStack(spacing: 6) {
-                        Circle()
-                            .fill(vm.isRecording ? Color.red : Color.red.opacity(0.45))
-                            .frame(width: 9, height: 9)
-                            .shadow(color: vm.isRecording ? .red.opacity(0.9) : .clear, radius: 4)
-                        Text(vm.isRecording ? vm.formattedRecordingTimecode : "STBY")
-                            .font(.system(size: 11, weight: .bold, design: .monospaced))
-                            .foregroundStyle(vm.isRecording ? .red : .white.opacity(0.85))
-                    }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 3)
-                    .background(vm.isRecording ? Color.red.opacity(0.18) : Color.white.opacity(0.08), in: Capsule())
-                }
-                .buttonStyle(.plain)
-            }
-            .padding(.horizontal, 11)
-            .padding(.vertical, 5)
-            .background(.ultraThinMaterial.opacity(0.85), in: Capsule())
-            .overlay(Capsule().stroke(.white.opacity(0.14), lineWidth: 0.5))
-        }
-    }
-
-    private var connectionStatusColor: Color {
-        if vm.isConnecting { return .yellow }
-        if vm.isCameraConnected || vm.isUVCActive { return .green }
-        if vm.isTestPatternActive { return .cyan }
-        return .gray
-    }
-
-    private var batteryIconName: String {
-        switch vm.batteryPercent {
-        case 80...100: return "battery.100"
-        case 55..<80:  return "battery.75"
-        case 30..<55:  return "battery.50"
-        case 11..<30:  return "battery.25"
-        default:       return "battery.0"
-        }
-    }
-
-    private var pillDivider: some View {
-        Rectangle()
-            .fill(.white.opacity(0.16))
-            .frame(width: 0.5, height: 16)
-    }
-
-    private func isControlWritable(_ control: ActiveExposureControl) -> Bool {
-        switch control {
-        case .aperture: return vm.isApertureWritable
-        case .shutter:  return vm.isShutterWritable
-        case .iso:      return vm.isISOWritable
-        case .exposureBias, .whiteBalance: return true
-        }
-    }
-
-    private func lockedReasonMessage(for control: ActiveExposureControl) -> String {
-        let modeText = vm.currentExposureMode?.shortBadge
-        switch control {
-        case .aperture:
-            if vm.currentExposureMode?.allowsManualAperture == false, let modeText {
-                return "当前 \(modeText) 档位由机身自动控制光圈，不可手动调节"
-            }
-            return "当前镜头不支持电控光圈，或光圈环未拧至 A 档"
-        case .shutter:
-            if vm.currentExposureMode?.allowsManualShutter == false, let modeText {
-                return "当前 \(modeText) 档位由机身自动控制快门，不可手动调节"
-            }
-            return "当前拍摄模式下快门不可手动调节"
-        case .iso:
-            if let modeText {
-                return "当前 \(modeText) 档位下 ISO 不可手动调节"
-            }
-            return "当前拍摄模式下 ISO 不可手动调节"
-        case .exposureBias, .whiteBalance:
-            return ""
-        }
-    }
-
-    private func exposurePillCell(label: String, value: String, control: ActiveExposureControl) -> some View {
-        let writable = isControlWritable(control)
-        let isSelected = writable && vm.activeExposureControl == control
-        return Button {
-            guard writable else {
-                let msg = lockedReasonMessage(for: control)
-                if !msg.isEmpty { vm.showBanner(msg) }
-                return
-            }
-            withAnimation(.snappy(duration: 0.2)) {
-                vm.activeToolInspector = nil
-                vm.activeExposureControl = isSelected ? nil : control
-            }
-        } label: {
-            HStack(spacing: 4) {
-                Text(label)
-                    .font(.system(size: 9, weight: .bold, design: .monospaced))
-                    .foregroundStyle(isSelected ? .black.opacity(0.75) : .white.opacity(writable ? 0.5 : 0.3))
-                Text(value)
-                    .font(.system(size: 12, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(isSelected ? .black : .white.opacity(writable ? 1.0 : 0.45))
-                if !writable {
-                    Image(systemName: "lock.fill")
-                        .font(.system(size: 8, weight: .bold))
-                        .foregroundStyle(.white.opacity(0.38))
-                }
-            }
-            .padding(.horizontal, 9)
-            .padding(.vertical, 5)
-            .background(isSelected ? Color.yellow : Color.clear, in: Capsule())
-        }
-        .buttonStyle(.plain)
-    }
-
-    /// 左下角：当前相机曝光档位徽标 (如 A / S / M / P / AUTO / MOVIE M / S&Q M)
-    private var bottomLeftExposureModeBadge: some View {
-        let badgeText: String = {
-            if let mode = vm.currentExposureMode {
-                return mode.shortBadge
-            }
-            if vm.isTestPatternActive {
-                return "SIM"
-            }
-            return vm.isCameraConnected ? "--" : "OFFLINE"
-        }()
-        let isMovie = vm.currentExposureMode?.isMovieMode == true
-        let isActive = vm.currentExposureMode != nil
-
-        return HStack(spacing: 6) {
-            Image(systemName: isMovie ? "video.fill" : "dial.medium.fill")
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(isMovie ? .red : (isActive ? .yellow : .white.opacity(0.45)))
-
-            Text(badgeText)
-                .font(.system(size: 13, weight: .heavy, design: .monospaced))
-                .foregroundStyle(isActive ? .white : .white.opacity(0.5))
-
-            if let mode = vm.currentExposureMode {
-                Divider()
-                    .frame(height: 11)
-                    .background(.white.opacity(0.25))
-                Text(mode.displayName)
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.72))
-            }
-        }
-        .padding(.horizontal, 11)
-        .padding(.vertical, 6)
-        .background(.black.opacity(0.74), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .stroke(isActive ? Color.yellow.opacity(0.45) : Color.white.opacity(0.14), lineWidth: 0.7)
-        )
-        .allowsHitTesting(false)
-    }
-
-    // MARK: - LAYER 2B: 右侧悬浮专业工具栏
-
-    private var rightFloatingToolbar: some View {
-        VStack(spacing: 5) {
-            // 1. 3D LUT 开关 / 本地收藏夹
-            toolButton(
-                title: "LUT",
-                icon: "cube.transparent",
-                isActive: vm.renderSettings.isLUTEnabled,
-                action: {
-                    if vm.loadedLUTName == nil {
-                        toggleInspector(.lut)
-                    } else {
-                        vm.renderSettings.isLUTEnabled.toggle()
-                    }
-                },
-                onLongPress: { toggleInspector(.lut) }
-            )
-
-            // 2. 专业示波器浮窗 (波形 / RGB分量 / 矢量 / 直方图)
-            toolButton(
-                title: "示波器",
-                icon: "waveform.path.ecg",
-                isActive: vm.isScopesVisible,
-                action: {
-                    withAnimation(.snappy(duration: 0.2)) {
-                        vm.isScopesVisible.toggle()
-                        vm.renderSettings.isScopesEnabled = vm.isScopesVisible
-                    }
-                }
-            )
-
-            // 3. 12 段假色
-            toolButton(
-                title: "假色",
-                icon: "paintpalette",
-                isActive: vm.renderSettings.isFalseColorEnabled,
-                action: {
-                    vm.renderSettings.isFalseColorEnabled.toggle()
-                }
-            )
-
-            // 4. Sobel 峰值对焦
-            toolButton(
-                title: "峰值",
-                icon: "camera.metering.center.weighted",
-                isActive: vm.renderSettings.isPeakingEnabled,
-                action: {
-                    vm.renderSettings.isPeakingEnabled.toggle()
-                },
-                onLongPress: { toggleInspector(.peaking) }
-            )
-
-            // 5. 动态斑马纹
-            toolButton(
-                title: "斑马",
-                icon: "line.3.horizontal.decrease",
-                isActive: vm.renderSettings.isZebraEnabled,
-                action: {
-                    vm.renderSettings.isZebraEnabled.toggle()
-                },
-                onLongPress: { toggleInspector(.zebra) }
-            )
-
-            // 6. 安全框比例 & 三分九宫格
-            toolButton(
-                title: vm.frameGuide == .off ? (vm.isGridEnabled ? "三分线" : "安全框") : vm.frameGuide.rawValue,
-                icon: "viewfinder.rectangular",
-                isActive: vm.frameGuide != .off || vm.isGridEnabled,
-                action: {
-                    vm.frameGuide = vm.frameGuide.next
-                },
-                onLongPress: { toggleInspector(.guides) }
-            )
-
-            // 7. 画面水平镜像 / 垂直翻转 (单击切换水平镜像，长按展开 H/V 面板)
-            toolButton(
-                title: flipButtonTitle,
-                icon: "arrow.left.and.right.righttriangle.left.righttriangle.right",
-                isActive: vm.renderSettings.flipHorizontal || vm.renderSettings.flipVertical,
-                action: {
-                    vm.renderSettings.flipHorizontal.toggle()
-                },
-                onLongPress: { toggleInspector(.flip) }
-            )
-
-            // 8. 变形镜头反挤压 (1.0x / 1.33x / 1.5x / 2.0x)
-            toolButton(
-                title: vm.renderSettings.desqueeze.displayName,
-                icon: "arrow.left.and.right.square",
-                isActive: vm.renderSettings.desqueeze != .off,
-                action: {
-                    let all = AnamorphicDesqueeze.allCases
-                    if let idx = all.firstIndex(of: vm.renderSettings.desqueeze) {
-                        vm.renderSettings.desqueeze = all[(idx + 1) % all.count]
-                    }
-                }
-            )
-        }
-        .padding(.vertical, 6)
-        .padding(.horizontal, 5)
-        .background(.black.opacity(0.68), in: RoundedRectangle(cornerRadius: 15, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 15, style: .continuous)
-                .stroke(.white.opacity(0.14), lineWidth: 0.6)
-        )
-    }
-
-    private var flipButtonTitle: String {
-        switch (vm.renderSettings.flipHorizontal, vm.renderSettings.flipVertical) {
-        case (true, true):  return "H+V"
-        case (true, false): return "镜像H"
-        case (false, true): return "翻转V"
-        case (false, false): return "翻转"
-        }
-    }
-
-    private func toolButton(
-        title: String,
-        icon: String,
-        isActive: Bool,
-        action: @escaping () -> Void,
-        onLongPress: (() -> Void)? = nil
-    ) -> some View {
-        Button(action: action) {
-            VStack(spacing: 1) {
-                Image(systemName: icon)
-                    .font(.system(size: 12, weight: .semibold))
-                Text(title)
-                    .font(.system(size: 7.5, weight: .semibold, design: .monospaced))
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.7)
-            }
-            .foregroundStyle(isActive ? .black : .white.opacity(0.88))
-            .frame(width: 42, height: 32)
-            .background(isActive ? Color.yellow : Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-        }
-        .buttonStyle(.plain)
-        .simultaneousGesture(
-            LongPressGesture(minimumDuration: 0.35)
-                .onEnded { _ in
-                    onLongPress?()
-                }
-        )
-    }
-
-    private func toggleInspector(_ kind: MonitorViewModel.ToolInspectorKind) {
-        let feedback = UIImpactFeedbackGenerator(style: .medium)
-        feedback.impactOccurred()
-        withAnimation(.snappy(duration: 0.2)) {
-            vm.activeExposureControl = nil
-            vm.activeToolInspector = (vm.activeToolInspector == kind) ? nil : kind
-        }
-    }
-
-    // MARK: - LAYER 2C: 底部弹出快捷滚轮与工具细调面板
-
-    @ViewBuilder
-    private var bottomContextualDrawer: some View {
-        if let control = vm.activeExposureControl {
-            exposureWheelDrawer(for: control)
-                .transition(.move(edge: .bottom).combined(with: .opacity))
-        } else if let inspector = vm.activeToolInspector {
-            toolInspectorDrawer(for: inspector)
-                .transition(.move(edge: .bottom).combined(with: .opacity))
-        }
-    }
-
-    private func exposureWheelDrawer(for control: ActiveExposureControl) -> some View {
-        VStack(spacing: 8) {
-            HStack {
-                Text(control.title)
-                    .font(.system(size: 10, weight: .bold, design: .monospaced))
-                    .foregroundStyle(.yellow)
-                Spacer()
-                Button {
-                    withAnimation(.snappy(duration: 0.2)) { vm.activeExposureControl = nil }
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 16))
-                        .foregroundStyle(.white.opacity(0.6))
-                }
-                .buttonStyle(.plain)
-            }
-            .padding(.horizontal, 14)
-
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
-                    switch control {
-                    case .shutter:
-                        if vm.isCameraConnected && (!vm.isShutterWritable || vm.shutterPresets.isEmpty) {
-                            Text("当前拍摄模式不支持手动调节快门（请切至 S / M 模式）")
-                                .font(.system(size: 11))
-                                .foregroundStyle(.white.opacity(0.65))
-                                .padding(.vertical, 6)
-                        } else {
-                            ForEach(vm.shutterPresets, id: \.self) { preset in
-                                wheelChip(
-                                    title: preset.description,
-                                    isSelected: vm.currentShutter == preset
-                                ) {
-                                    vm.setShutter(preset)
-                                }
-                            }
-                        }
-
-                    case .aperture:
-                        if vm.isCameraConnected && (!vm.isApertureWritable || vm.aperturePresets.isEmpty) {
-                            Text("当前镜头或拍摄模式不支持电控光圈（请检查光圈环置于 A 档或切至 A/M 模式）")
-                                .font(.system(size: 11))
-                                .foregroundStyle(.white.opacity(0.65))
-                                .padding(.vertical, 6)
-                        } else {
-                            ForEach(vm.aperturePresets, id: \.self) { preset in
-                                wheelChip(
-                                    title: preset.description,
-                                    isSelected: vm.currentAperture == preset
-                                ) {
-                                    vm.setAperture(preset)
-                                }
-                            }
-                        }
-
-                    case .iso:
-                        if vm.isCameraConnected && (!vm.isISOWritable || vm.isoPresets.isEmpty) {
-                            Text("当前拍摄模式或机身设置不支持手动调节 ISO")
-                                .font(.system(size: 11))
-                                .foregroundStyle(.white.opacity(0.65))
-                                .padding(.vertical, 6)
-                        } else {
-                            ForEach(vm.isoPresets, id: \.self) { preset in
-                                wheelChip(
-                                    title: preset.description.replacingOccurrences(of: "ISO ", with: ""),
-                                    isSelected: vm.currentISO == preset
-                                ) {
-                                    vm.setISO(preset)
-                                }
-                            }
-                        }
-
-                    case .exposureBias:
-                        ForEach(vm.exposureBiasPresets, id: \.self) { preset in
-                            wheelChip(
-                                title: preset.description,
-                                isSelected: vm.currentExposureBias == preset
-                            ) {
-                                vm.setExposureBias(preset)
-                            }
-                        }
-
-                    case .whiteBalance:
-                        ForEach(vm.whiteBalancePresets, id: \.self) { preset in
-                            wheelChip(
-                                title: preset.description,
-                                isSelected: vm.currentWhiteBalance == preset
-                            ) {
-                                vm.setWhiteBalance(preset)
-                            }
-                        }
-                    }
-                }
-                .padding(.horizontal, 14)
-            }
-
-            // 当选中白平衡时，下方附加 2500K–9900K 精准色温滚轮 (0xD20F)
-            if control == .whiteBalance {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 6) {
-                        Text("K")
-                            .font(.system(size: 10, weight: .bold, design: .monospaced))
-                            .foregroundStyle(.cyan)
-                        ForEach(vm.colorTempPresets, id: \.self) { kelvin in
-                            let selected = vm.currentWhiteBalance == .colorTempFilter && vm.currentColorTemp == kelvin
-                            Button("\(kelvin)K") {
-                                let haptic = UISelectionFeedbackGenerator()
-                                haptic.selectionChanged()
-                                vm.setColorTemperature(kelvin)
-                            }
-                            .font(.system(size: 11, weight: selected ? .bold : .medium, design: .monospaced))
-                            .foregroundStyle(selected ? .black : .cyan)
-                            .padding(.horizontal, 9)
-                            .padding(.vertical, 4)
-                            .background(selected ? Color.cyan : Color.cyan.opacity(0.14), in: Capsule())
-                            .buttonStyle(.plain)
-                        }
-                    }
-                    .padding(.horizontal, 14)
-                }
-            }
-        }
-        .padding(.vertical, 10)
-        .frame(maxWidth: 520)
-        .background(.black.opacity(0.84), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(.white.opacity(0.18), lineWidth: 0.6)
-        )
-    }
-
-    private func wheelChip(title: String, isSelected: Bool, action: @escaping () -> Void) -> some View {
-        Button {
-            let haptic = UISelectionFeedbackGenerator()
-            haptic.selectionChanged()
-            action()
-        } label: {
-            VStack(spacing: 4) {
-                Text(title)
-                    .font(.system(size: 13, weight: isSelected ? .bold : .medium, design: .monospaced))
-                    .foregroundStyle(isSelected ? .black : .white.opacity(0.9))
-                Rectangle()
-                    .fill(isSelected ? Color.black.opacity(0.6) : Color.white.opacity(0.25))
-                    .frame(width: 2, height: isSelected ? 8 : 5)
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
-            .background(isSelected ? Color.yellow : Color.white.opacity(0.1), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        }
-        .buttonStyle(.plain)
-    }
-
-    /// 长按工具栏按钮呼出的专业参数细调条（LUT 导入与强度、峰值颜色与灵敏度、斑马纹 IRE 阈值、安全框选择）
-    private func toolInspectorDrawer(for inspector: MonitorViewModel.ToolInspectorKind) -> some View {
-        HStack(spacing: 14) {
-            switch inspector {
-            case .lut:
-                Button {
-                    vm.isLUTImporterPresented = true
-                } label: {
-                    Label("导入", systemImage: "folder.badge.plus")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(.black)
-                        .padding(.horizontal, 9)
-                        .padding(.vertical, 5)
-                        .background(Color.yellow, in: Capsule())
-                }
-                .buttonStyle(.plain)
-
-                // 本地持久化多 .cube LUT 收藏夹横向切换条
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 6) {
-                        Button("演示 LUT") {
-                            vm.activeSavedLUTID = nil
-                            vm.loadBuiltInDemoLUT()
-                        }
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(vm.activeSavedLUTID == nil && vm.renderSettings.isLUTEnabled ? .black : .white)
-                        .padding(.horizontal, 9)
-                        .padding(.vertical, 5)
-                        .background(
-                            vm.activeSavedLUTID == nil && vm.renderSettings.isLUTEnabled ? Color.yellow : Color.white.opacity(0.14),
-                            in: Capsule()
-                        )
-                        .buttonStyle(.plain)
-
-                        ForEach(vm.savedLUTs) { item in
-                            let isCurrent = vm.activeSavedLUTID == item.id && vm.renderSettings.isLUTEnabled
-                            HStack(spacing: 4) {
-                                Button(item.displayName) {
-                                    vm.selectSavedLUT(item)
-                                }
-                                .font(.system(size: 11, weight: isCurrent ? .bold : .medium, design: .monospaced))
-                                .foregroundStyle(isCurrent ? .black : .white)
-                                .lineLimit(1)
-                                .buttonStyle(.plain)
-
-                                Button {
-                                    vm.deleteSavedLUT(item)
-                                } label: {
-                                    Image(systemName: "xmark")
-                                        .font(.system(size: 8, weight: .bold))
-                                        .foregroundStyle(isCurrent ? .black.opacity(0.7) : .white.opacity(0.55))
-                                }
-                                .buttonStyle(.plain)
-                            }
-                            .padding(.horizontal, 9)
-                            .padding(.vertical, 5)
-                            .background(isCurrent ? Color.yellow : Color.white.opacity(0.14), in: Capsule())
-                        }
-                    }
-                }
-                .frame(maxWidth: 260)
-
-                HStack(spacing: 6) {
-                    Text("\(Int(vm.renderSettings.lutIntensity * 100))%")
-                        .font(.system(size: 11, design: .monospaced))
-                        .foregroundStyle(.white.opacity(0.8))
-                    Slider(value: $vm.renderSettings.lutIntensity, in: 0...1)
-                        .tint(.yellow)
-                        .frame(width: 90)
-                }
-
-            case .peaking:
-                Text("峰值颜色")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.75))
-                ForEach(FocusPeakingColor.allCases) { color in
-                    Button(color.displayName) {
-                        vm.renderSettings.peakingColor = color
-                        vm.renderSettings.isPeakingEnabled = true
-                    }
-                    .font(.system(size: 11, weight: .bold))
-                    .foregroundStyle(vm.renderSettings.peakingColor == color ? .black : .white)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 5)
-                    .background(
-                        vm.renderSettings.peakingColor == color ? Color.yellow : Color.white.opacity(0.14),
-                        in: Capsule()
-                    )
-                    .buttonStyle(.plain)
-                }
-                HStack(spacing: 6) {
-                    Text("灵敏度 \(Int(vm.renderSettings.peakingSensitivity * 100))%")
-                        .font(.system(size: 11, design: .monospaced))
-                        .foregroundStyle(.white.opacity(0.8))
-                    Slider(value: $vm.renderSettings.peakingSensitivity, in: 0...1)
-                        .tint(.yellow)
-                        .frame(width: 110)
-                }
-
-            case .zebra:
-                Text("斑马纹阈值")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.75))
-                ForEach([Float(70), 80, 90, 95, 100], id: \.self) { ire in
-                    Button("\(Int(ire)) IRE") {
-                        vm.renderSettings.zebraThresholdIRE = ire
-                        vm.renderSettings.isZebraEnabled = true
-                    }
-                    .font(.system(size: 11, weight: .bold, design: .monospaced))
-                    .foregroundStyle(vm.renderSettings.zebraThresholdIRE == ire ? .black : .white)
-                    .padding(.horizontal, 9)
-                    .padding(.vertical, 5)
-                    .background(
-                        vm.renderSettings.zebraThresholdIRE == ire ? Color.yellow : Color.white.opacity(0.14),
-                        in: Capsule()
-                    )
-                    .buttonStyle(.plain)
-                }
-
-            case .guides:
-                Button {
-                    vm.isGridEnabled.toggle()
-                } label: {
-                    Label("三分线", systemImage: "grid")
-                        .font(.system(size: 11, weight: .bold))
-                        .foregroundStyle(vm.isGridEnabled ? .black : .white)
-                        .padding(.horizontal, 9)
-                        .padding(.vertical, 5)
-                        .background(vm.isGridEnabled ? Color.cyan : Color.white.opacity(0.14), in: Capsule())
-                }
-                .buttonStyle(.plain)
-
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 6) {
-                        ForEach(FrameGuideAspect.allCases) { guide in
-                            Button(guide.rawValue) {
-                                vm.frameGuide = guide
-                            }
-                            .font(.system(size: 11, weight: .bold, design: .monospaced))
-                            .foregroundStyle(vm.frameGuide == guide ? .black : .white)
-                            .padding(.horizontal, 9)
-                            .padding(.vertical, 5)
-                            .background(
-                                vm.frameGuide == guide ? Color.yellow : Color.white.opacity(0.14),
-                                in: Capsule()
-                            )
-                            .buttonStyle(.plain)
-                        }
-                    }
-                }
-                .frame(maxWidth: 340)
-
-            case .flip:
-                Text("画面翻转")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.75))
-
-                Button("水平镜像 H") {
-                    vm.renderSettings.flipHorizontal.toggle()
-                }
-                .font(.system(size: 11, weight: .bold))
-                .foregroundStyle(vm.renderSettings.flipHorizontal ? .black : .white)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .background(vm.renderSettings.flipHorizontal ? Color.yellow : Color.white.opacity(0.14), in: Capsule())
-                .buttonStyle(.plain)
-
-                Button("垂直翻转 V") {
-                    vm.renderSettings.flipVertical.toggle()
-                }
-                .font(.system(size: 11, weight: .bold))
-                .foregroundStyle(vm.renderSettings.flipVertical ? .black : .white)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .background(vm.renderSettings.flipVertical ? Color.yellow : Color.white.opacity(0.14), in: Capsule())
-                .buttonStyle(.plain)
-
-                if vm.renderSettings.flipHorizontal || vm.renderSettings.flipVertical {
-                    Button("复位") {
-                        vm.renderSettings.flipHorizontal = false
-                        vm.renderSettings.flipVertical = false
-                    }
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.85))
-                    .padding(.horizontal, 9)
-                    .padding(.vertical, 5)
-                    .background(Color.white.opacity(0.14), in: Capsule())
-                    .buttonStyle(.plain)
-                }
-            }
-
-            Button {
-                withAnimation(.snappy(duration: 0.2)) { vm.activeToolInspector = nil }
-            } label: {
-                Image(systemName: "xmark.circle.fill")
-                    .foregroundStyle(.white.opacity(0.6))
-            }
-            .buttonStyle(.plain)
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 9)
-        .background(.black.opacity(0.84), in: Capsule())
-        .overlay(Capsule().stroke(.white.opacity(0.18), lineWidth: 0.6))
-    }
-
-    // MARK: - 无信号待机引导浮层
-
-    private var standbyOverlay: some View {
-        VStack(spacing: 12) {
-            Image(systemName: "video.slash")
-                .font(.system(size: 28, weight: .light))
-                .foregroundStyle(.white.opacity(0.45))
-            Text("CineView Pro · Sony A6700")
-                .font(.system(size: 14, weight: .semibold, design: .monospaced))
-                .foregroundStyle(.white.opacity(0.85))
-            Text("未检测到视频输入，请连接 UVC 采集卡或 Sony 5GHz Wi-Fi / USB-LAN")
-                .font(.system(size: 11))
-                .foregroundStyle(.white.opacity(0.55))
-            HStack(spacing: 12) {
-                Button {
-                    Task { await vm.startTestPattern() }
-                } label: {
-                    Label("启动测试信号 (仿真)", systemImage: "tv.and.mediabox")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(.black)
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 8)
-                        .background(Color.yellow, in: Capsule())
-                }
-                .buttonStyle(.plain)
-
-                Button {
-                    vm.isConnectionSheetPresented = true
-                } label: {
-                    Label("连接真机相机", systemImage: "bolt.horizontal.circle")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 8)
-                        .background(Color.white.opacity(0.14), in: Capsule())
-                }
-                .buttonStyle(.plain)
-            }
-            .padding(.top, 4)
-        }
-        .padding(22)
-        .background(.black.opacity(0.65), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .stroke(.white.opacity(0.12), lineWidth: 0.6)
-        )
     }
 
     // MARK: - 强制请求横屏几何方向 (iOS 16+)
@@ -2197,7 +1191,7 @@ public struct ContentView: View {
 // MARK: - 7. 专业辅助叠加组件 (安全框 / 对焦框 / 假色标尺 / 实时示波器浮窗 / 连接弹窗)
 
 /// 安全框与三分构图九宫格叠加层 (2.39:1 / 2.35:1 / 16:9 / 4:3 / 1:1 / 9:16 + 三分线)
-private struct FrameGuideOverlay: View {
+struct FrameGuideOverlay: View {
     let videoRect: CGRect
     let guideAspect: CGFloat?
     let showRuleOfThirds: Bool
@@ -2273,16 +1267,16 @@ private struct FrameGuideOverlay: View {
 }
 
 /// 触控对焦电影机风格角标框
-private struct FocusReticleView: View {
+struct FocusReticleView: View {
     let isLocked: Bool
 
     var body: some View {
         ZStack {
             RoundedRectangle(cornerRadius: 4)
-                .stroke(isLocked ? Color.green : Color.yellow, lineWidth: 1.8)
+                .stroke(isLocked ? MonitorTheme.statusGreen : MonitorTheme.accentAmber, lineWidth: 1.8)
                 .frame(width: isLocked ? 52 : 64, height: isLocked ? 52 : 64)
             Circle()
-                .fill(isLocked ? Color.green : Color.yellow)
+                .fill(isLocked ? MonitorTheme.statusGreen : MonitorTheme.accentAmber)
                 .frame(width: 4, height: 4)
         }
         .shadow(color: .black.opacity(0.8), radius: 2)
@@ -2291,7 +1285,7 @@ private struct FocusReticleView: View {
 }
 
 /// 12 段假色 IRE 色标图例条
-private struct FalseColorLegendBar: View {
+struct FalseColorLegendBar: View {
     var body: some View {
         VStack(spacing: 1) {
             ForEach(FalseColorBand.standard12Bands.reversed()) { band in
@@ -2300,7 +1294,8 @@ private struct FalseColorLegendBar: View {
                         .fill(Color(red: Double(band.rgb.x), green: Double(band.rgb.y), blue: Double(band.rgb.z)))
                         .frame(width: 10, height: 14)
                     Text("\(Int(band.rangeIRE.upperBound))")
-                        .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                        .font(.robotoFlex(size: 8.5, weight: 600))
+                        .monospacedDigit()
                         .foregroundStyle(.white.opacity(0.85))
                         .frame(width: 20, alignment: .leading)
                 }
@@ -2308,16 +1303,16 @@ private struct FalseColorLegendBar: View {
         }
         .padding(.vertical, 6)
         .padding(.horizontal, 5)
-        .background(.black.opacity(0.68), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .background(MonitorTheme.drawerBackground.opacity(0.82), in: RoundedRectangle(cornerRadius: MonitorTheme.cardRadius, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(.white.opacity(0.15), lineWidth: 0.5)
+            RoundedRectangle(cornerRadius: MonitorTheme.cardRadius, style: .continuous)
+                .stroke(MonitorTheme.border, lineWidth: 0.5)
         )
     }
 }
 
 /// 可拖动实时波形图 (Waveform) & RGB 直方图浮窗 (由 MonitorShaders.metal Compute Shader 驱动)
-private struct ScopesFloatingWidget: View {
+struct ScopesFloatingWidget: View {
     let scope: ScopeAnalysisResult?
     @Binding var mode: ScopeDisplayMode
     @Binding var applyLUT: Bool
@@ -2326,27 +1321,27 @@ private struct ScopesFloatingWidget: View {
     var body: some View {
         VStack(spacing: 6) {
             // 顶部小标题栏
-            HStack(spacing: 8) {
+            HStack(spacing: 6) {
                 ForEach(ScopeDisplayMode.allCases, id: \.self) { m in
                     Button(m.rawValue) {
                         mode = m
                     }
-                    .font(.system(size: 9, weight: .bold))
-                    .foregroundStyle(mode == m ? .black : .white.opacity(0.7))
+                    .font(.robotoFlex(size: 9.5, weight: mode == m ? 700 : 500))
+                    .foregroundStyle(mode == m ? .black : .white.opacity(0.72))
                     .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(mode == m ? Color.yellow : Color.white.opacity(0.1), in: Capsule())
+                    .padding(.vertical, 2.5)
+                    .background(mode == m ? MonitorTheme.accentAmber : Color.white.opacity(0.10), in: Capsule())
                     .buttonStyle(.plain)
                 }
 
                 Button(applyLUT ? "Post-LUT" : "Log") {
                     applyLUT.toggle()
                 }
-                .font(.system(size: 8, weight: .semibold, design: .monospaced))
-                .foregroundStyle(.cyan)
-                .padding(.horizontal, 5)
-                .padding(.vertical, 2)
-                .background(Color.cyan.opacity(0.15), in: Capsule())
+                .font(.robotoFlex(size: 8.5, weight: 650))
+                .foregroundStyle(MonitorTheme.diagnosticCyan)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2.5)
+                .background(MonitorTheme.diagnosticCyan.opacity(0.15), in: Capsule())
                 .buttonStyle(.plain)
 
                 Spacer(minLength: 4)
@@ -2354,7 +1349,7 @@ private struct ScopesFloatingWidget: View {
                 Button(action: onClose) {
                     Image(systemName: "xmark")
                         .font(.system(size: 9, weight: .bold))
-                        .foregroundStyle(.white.opacity(0.6))
+                        .foregroundStyle(.white.opacity(0.7))
                 }
                 .buttonStyle(.plain)
             }
@@ -2571,101 +1566,5 @@ private struct ScopesFloatingWidget: View {
             drawChannel(scope.lumaHistogram, color: .white.opacity(0.7))
         }
         .background(Color.black.opacity(0.5), in: RoundedRectangle(cornerRadius: 6))
-    }
-}
-
-/// 连接配置 Sheet (支持 Wi-Fi / USB-LAN IP 配置、UVC 有线采集卡切换、混合双模)
-private struct ConnectionSettingsSheet: View {
-    @Bindable var vm: MonitorViewModel
-    @Environment(\.dismiss) private var dismiss
-
-    var body: some View {
-        NavigationStack {
-            Form {
-                Section("选择监看模式") {
-                    Picker("模式", selection: $vm.connectionMode) {
-                        ForEach(MonitorConnectionMode.allCases) { mode in
-                            Label(mode.rawValue, systemImage: mode.symbolName).tag(mode)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-
-                    Text(vm.connectionMode.subtitle)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
-                if vm.connectionMode != .uvcWired {
-                    Section("Sony A6700 PTP/IP 地址 (TCP 15740)") {
-                        TextField("相机 IP (默认 192.168.122.1)", text: $vm.cameraIP)
-                            .keyboardType(.decimalPad)
-                            .font(.system(.body, design: .monospaced))
-
-                        Picker("Wi-Fi 预览画质 (0xD26A)", selection: Binding(
-                            get: { vm.liveViewQuality },
-                            set: { vm.setLiveViewQuality($0) }
-                        )) {
-                            Text("流畅优先 (Low)").tag(SonyLiveViewImageQuality.low)
-                            Text("清晰优先 (High)").tag(SonyLiveViewImageQuality.high)
-                        }
-                        .pickerStyle(.segmented)
-
-                        if !vm.ptpDiagnosticText.isEmpty {
-                            Text(vm.ptpDiagnosticText)
-                                .font(.system(size: 11, design: .monospaced))
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                }
-
-                Section {
-                    Button {
-                        Task {
-                            await vm.connectCurrentMode()
-                            dismiss()
-                        }
-                    } label: {
-                        HStack {
-                            Spacer()
-                            if vm.isConnecting {
-                                ProgressView().padding(.trailing, 6)
-                            }
-                            Text(vm.isCameraConnected || vm.isUVCActive ? "重新连接" : "立即连接")
-                                .fontWeight(.semibold)
-                            Spacer()
-                        }
-                    }
-
-                    Button {
-                        Task {
-                            await vm.startTestPattern()
-                            dismiss()
-                        }
-                    } label: {
-                        HStack {
-                            Spacer()
-                            Label("启用内置动态测试信号 (模拟器仿真)", systemImage: "tv.and.mediabox")
-                            Spacer()
-                        }
-                    }
-
-                    if vm.isCameraConnected || vm.isUVCActive || vm.isTestPatternActive {
-                        Button("断开当前信号", role: .destructive) {
-                            Task {
-                                await vm.disconnectAll()
-                                dismiss()
-                            }
-                        }
-                    }
-                }
-            }
-            .navigationTitle("信号源与相机连接")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("关闭") { dismiss() }
-                }
-            }
-        }
     }
 }

@@ -32,6 +32,10 @@
 	<array>
 		<string>_ptp._tcp</string>
 	</array>
+	<key>UIAppFonts</key>
+	<array>
+		<string>RobotoFlex.ttf</string>
+	</array>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

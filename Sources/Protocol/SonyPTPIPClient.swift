@@ -67,6 +67,7 @@ public enum SonyPTPOpCode: UInt16, Sendable {
     case closeSession               = 0x1003
     case getObjectInfo              = 0x1008
     case getObject                  = 0x1009
+    case getThumb                   = 0x100A
 
     // --- Sony 私有 SDIO 扩展 OpCodes (0x92xx) ---
     /// Sony SDIO 握手状态机 (Phase 1 -> Phase 2 -> [0x9202] -> Phase 3)
@@ -122,6 +123,8 @@ public enum SonyPTPPropCode: UInt16, Sendable {
     case shutterSpeed      = 0xD20D
     /// 精准色温值 Color Temperature (UInt16: 开尔文 K，2500...9900 步进 100K，如 5600K = 0x15E0)
     case colorTemperature  = 0xD20F
+    /// 相机内存待传输照片数 ObjectInMemory (UInt16: 0x0000 = 无, >= 0x8000 = 有刚拍照片在 0xFFFFC001 待拉取)
+    case objectInMemory    = 0xD215
     /// 录制状态只读属性 (UInt16: 0x0000 = 未录制, 0x0001 = 录制中)
     case recordingState    = 0xD21D
     /// ISO 感光度 (UInt32: 0x00FF_FFFF = Auto; 低 24 位为数值如 800 = 0x0000_0320)
@@ -142,12 +145,14 @@ public enum SonyPTPPropCode: UInt16, Sendable {
     case movieRecord       = 0xD2C8
 }
 
-/// Sony LiveView 虚拟对象句柄 (用于 0x1008 GetObjectInfo / 0x1009 GetObject)
+/// Sony 虚拟对象句柄 (用于 0x1008 GetObjectInfo / 0x1009 GetObject / 0x100A GetThumb)
 public enum SonyVirtualObjectHandle: UInt32, Sendable {
-    /// LiveView OSD / 对焦框信息对象句柄
-    case liveViewInfo  = 0xFFFF_C001
+    /// 相机刚拍摄完成、驻留在内存缓冲区待传输的照片对象句柄 (`ObjectInMemory` 对应句柄)
+    case capturedImage = 0xFFFF_C001
     /// LiveView 实时取景图像帧对象句柄 (含 Sony 私有头部 + 纯 JPEG 数据)
     case liveViewImage = 0xFFFF_C002
+
+    public static let liveViewInfo: SonyVirtualObjectHandle = .capturedImage
 }
 
 /// Sony 按键控制状态值 (用于 0x9207 SDIO_ControlDevice 负载，UInt16 LE)
@@ -778,13 +783,48 @@ public struct CameraStateSnapshot: Sendable {
     public let exposureProgramMode: SonyExposureProgramMode?
     public let isRecording: Bool
     public let isLiveViewEnabled: Bool
+    /// 相机内存待拉取的新拍照片状态 (`0xD215`, >= 0x8000 表示 `0xFFFFC001` 有新照片就绪)
+    public let objectInMemory: UInt16?
     /// 调试诊断摘要（记录 0x9209 返回字节数与解析属性个数，便于真机排查）
     public let diagnosticSummary: String
     public let rawProperties: [UInt16: SonyDevicePropertyDescriptor]
 }
 
+/// Sony 刚拍摄照片的 PTP ObjectInfo 元数据 (0x1008 GetObjectInfo)
+public struct SonyCapturedObjectInfo: Sendable {
+    public let handle: UInt32
+    public let storageID: UInt32
+    /// 0x3801 = JPEG, 0x3812 = HEIF, 0xB101 = Sony ARW RAW
+    public let objectFormat: UInt16
+    public let compressedSize: UInt32
+    public let thumbFormat: UInt16
+    public let thumbCompressedSize: UInt32
+    public let imageWidth: UInt32
+    public let imageHeight: UInt32
+    public let filename: String
+    public let captureDate: String
+
+    public var formatDisplayName: String {
+        switch objectFormat {
+        case 0x3801: return "JPEG"
+        case 0x3812: return "HEIF"
+        case 0xB101: return "ARW"
+        default:     return String(format: "0x%04X", objectFormat)
+        }
+    }
+}
+
+/// 通过 PTP/IP 拉取到的刚拍摄照片载荷与元数据
+public struct SonyCapturedPhoto: Sendable {
+    public let info: SonyCapturedObjectInfo
+    public let imageData: Data
+    public let thumbnailData: Data?
+}
+
 /// Sony / 标准 PTP 常用异步事件码
 public enum SonyPTPEventCode: UInt16, Sendable {
+    /// 标准 PTP: 新对象添加
+    case objectAdded                 = 0x4002
     /// 标准 PTP: 设备属性变更
     case devicePropChanged           = 0x4006
     /// Sony 私有: 新对象添加 (如连拍/拍照完成)
@@ -900,7 +940,7 @@ private actor PTPIPTCPChannel {
     private var isClosed = false
 
     /// 单个 PTP/IP 包最大允许长度 (32 MB 安全上限，足以容纳 LiveView 与大属性表)
-    private static let maxPacketLength = 32 * 1024 * 1024
+    private static let maxPacketLength = 96 * 1024 * 1024
 
     init(
         name: String,
@@ -1503,6 +1543,120 @@ public actor SonyPTPIPClient {
         try await setExtDeviceProperty(.liveViewImageQuality, payload: payload)
     }
 
+    /// 拉取相机刚拍摄并驻留在内存缓冲区 (`0xFFFFC001`) 的照片
+    /// - 流程：`0x1008 GetObjectInfo(handle)` -> 解析文件名/尺寸/格式 -> （可选 `0x100A GetThumb`）-> `0x1009 GetObject(handle)`
+    /// - 返回 `nil` 表示当前相机内存里没有待拉取的新拍照片（如返回 `0x2009 InvalidObjectHandle` 或长度为 0）
+    public func fetchCapturedPhoto(
+        handle: UInt32 = SonyVirtualObjectHandle.capturedImage.rawValue
+    ) async throws -> SonyCapturedPhoto? {
+        let infoResp = try await performTransaction(
+            opCode: .getObjectInfo,
+            dataPhase: .noDataOrDataIn,
+            parameters: [handle],
+            readTimeout: .seconds(8)
+        )
+
+        if infoResp.responseCode == PTPResponseCode.invalidObjectHandle.rawValue ||
+           infoResp.responseCode == PTPResponseCode.generalError.rawValue {
+            return nil
+        }
+
+        guard infoResp.responseCode == PTPResponseCode.ok.rawValue else {
+            throw SonyPTPIPError.ptpOperationFailed(
+                opCode: SonyPTPOpCode.getObjectInfo.rawValue,
+                responseCode: infoResp.responseCode
+            )
+        }
+
+        guard let info = Self.parseObjectInfo(infoResp.data, handle: handle),
+              info.compressedSize > 0 else {
+            return nil
+        }
+
+        // 若相机提供缩略图，顺带快速拉取作为兜底（失败不影响主图下载）
+        var thumbData: Data?
+        if info.thumbCompressedSize > 0 {
+            if let thumbResp = try? await performTransaction(
+                opCode: .getThumb,
+                dataPhase: .noDataOrDataIn,
+                parameters: [handle],
+                readTimeout: .seconds(6)
+            ), thumbResp.responseCode == PTPResponseCode.ok.rawValue, !thumbResp.data.isEmpty {
+                thumbData = thumbResp.data
+            }
+        }
+
+        // 执行 0x1009 GetObject 拉取完整图像载荷并自动清空相机 ObjectInMemory 队列
+        let objResp = try await performTransaction(
+            opCode: .getObject,
+            dataPhase: .noDataOrDataIn,
+            parameters: [handle],
+            readTimeout: .seconds(25)
+        )
+
+        guard objResp.responseCode == PTPResponseCode.ok.rawValue else {
+            throw SonyPTPIPError.ptpOperationFailed(
+                opCode: SonyPTPOpCode.getObject.rawValue,
+                responseCode: objResp.responseCode
+            )
+        }
+
+        guard !objResp.data.isEmpty else {
+            return nil
+        }
+
+        return SonyCapturedPhoto(info: info, imageData: objResp.data, thumbnailData: thumbData)
+    }
+
+    /// 解析标准 ISO 15740 PTP ObjectInfo 二进制数据集
+    private static func parseObjectInfo(_ data: Data, handle: UInt32) -> SonyCapturedObjectInfo? {
+        guard data.count >= 52 else { return nil }
+        let storageID = data.readUInt32LE(at: 0)
+        let objectFormat = data.readUInt16LE(at: 4)
+        let compressedSize = data.readUInt32LE(at: 8)
+        let thumbFormat = data.readUInt16LE(at: 12)
+        let thumbCompressedSize = data.readUInt32LE(at: 14)
+        let imageWidth = data.readUInt32LE(at: 26)
+        let imageHeight = data.readUInt32LE(at: 30)
+
+        var offset = 52
+        let filename = readPTPString(from: data, offset: &offset)
+        let captureDate = readPTPString(from: data, offset: &offset)
+
+        return SonyCapturedObjectInfo(
+            handle: handle,
+            storageID: storageID,
+            objectFormat: objectFormat,
+            compressedSize: compressedSize,
+            thumbFormat: thumbFormat,
+            thumbCompressedSize: thumbCompressedSize,
+            imageWidth: imageWidth,
+            imageHeight: imageHeight,
+            filename: filename.isEmpty ? "IMG_\(String(format: "%04X", handle & 0xFFFF)).JPG" : filename,
+            captureDate: captureDate
+        )
+    }
+
+    private static func readPTPString(from data: Data, offset: inout Int) -> String {
+        guard offset < data.count else { return "" }
+        let charCount = Int(data[offset])
+        offset += 1
+        guard charCount > 0 else { return "" }
+        let byteCount = charCount * 2
+        guard offset + byteCount <= data.count else {
+            offset = data.count
+            return ""
+        }
+        var units: [UInt16] = []
+        units.reserveCapacity(charCount)
+        for i in 0..<charCount {
+            let u = data.readUInt16LE(at: offset + i * 2)
+            if u != 0 { units.append(u) }
+        }
+        offset += byteCount
+        return String(decoding: units, as: UTF16.self)
+    }
+
     /// 精确剥离 Sony PTP LiveView (`0xFFFFC002`) 私有数据包头，提取纯 JPEG 图像 Data
     ///
     /// ### Sony PTP LiveView (`GetObject(0xFFFFC002)`) 数据段二进制结构：
@@ -1737,6 +1891,7 @@ public actor SonyPTPIPClient {
         let evBias = props[SonyPTPPropCode.exposureBias.rawValue]?.int16Value.map(SonyExposureBias.init(rawMilliEV:))
         let isRecording = (props[SonyPTPPropCode.recordingState.rawValue]?.uint16Value ?? 0) != 0
         let isLiveViewEnabled = (props[SonyPTPPropCode.liveViewStatus.rawValue]?.uint8Value ?? 0) != 0
+        let objectInMemory = props[SonyPTPPropCode.objectInMemory.rawValue]?.uint16Value
 
         func flagTag(_ desc: SonyDevicePropertyDescriptor?) -> String {
             guard let d = desc else { return "-" }
@@ -1768,6 +1923,7 @@ public actor SonyPTPIPClient {
             exposureProgramMode: exposureMode,
             isRecording: isRecording,
             isLiveViewEnabled: isLiveViewEnabled,
+            objectInMemory: objectInMemory,
             diagnosticSummary: diag,
             rawProperties: props
         )
@@ -2044,7 +2200,8 @@ public actor SonyPTPIPClient {
         dataPhase: PTPIPDataPhaseInfo,
         parameters: [UInt32],
         outboundData: Data? = nil,
-        explicitTransactionID: UInt32? = nil
+        explicitTransactionID: UInt32? = nil,
+        readTimeout: Duration = .seconds(5)
     ) async throws -> PTPTransactionResult {
         await acquireTransactionLock()
         defer { releaseTransactionLock() }
@@ -2113,7 +2270,7 @@ public actor SonyPTPIPClient {
             var expectedInboundLength: UInt64?
 
             while true {
-                let packet = try await cmdChannel.readPacket(timeout: .seconds(5))
+                let packet = try await cmdChannel.readPacket(timeout: readTimeout)
 
                 switch packet.packetType {
                 case .startData:
