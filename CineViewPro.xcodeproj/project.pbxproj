@@ -1,0 +1,294 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A10000010000000000000001 /* CineViewProApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000010000000000000001 /* CineViewProApp.swift */; };
+		A10000020000000000000001 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000020000000000000001 /* ContentView.swift */; };
+		A10000030000000000000001 /* MonitorRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000030000000000000001 /* MonitorRenderer.swift */; };
+		A10000040000000000000001 /* SonyPTPIPClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000040000000000000001 /* SonyPTPIPClient.swift */; };
+		A10000050000000000000001 /* TestPatternGenerator.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000050000000000000001 /* TestPatternGenerator.swift */; };
+		A10000060000000000000001 /* MonitorShaders.metal in Resources */ = {isa = PBXBuildFile; fileRef = A20000060000000000000001 /* MonitorShaders.metal */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		A20000010000000000000001 /* CineViewProApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CineViewProApp.swift; sourceTree = "<group>"; };
+		A20000020000000000000001 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		A20000030000000000000001 /* MonitorRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MonitorRenderer.swift; sourceTree = "<group>"; };
+		A20000040000000000000001 /* SonyPTPIPClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SonyPTPIPClient.swift; sourceTree = "<group>"; };
+		A20000050000000000000001 /* TestPatternGenerator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TestPatternGenerator.swift; sourceTree = "<group>"; };
+		A20000060000000000000001 /* MonitorShaders.metal */ = {isa = PBXFileReference; explicitFileType = text; path = MonitorShaders.metal; sourceTree = "<group>"; };
+		A20000070000000000000001 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		A20000080000000000000001 /* CineViewPro.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = CineViewPro.app; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		A30000010000000000000001 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		A40000010000000000000001 = {
+			isa = PBXGroup;
+			children = (
+				A40000030000000000000001 /* Sources */,
+				A40000020000000000000001 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		A40000020000000000000001 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				A20000080000000000000001 /* CineViewPro.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		A40000030000000000000001 /* Sources */ = {
+			isa = PBXGroup;
+			children = (
+				A40000040000000000000001 /* App */,
+				A40000050000000000000001 /* Protocol */,
+				A40000060000000000000001 /* Rendering */,
+				A40000070000000000000001 /* UI */,
+			);
+			path = Sources;
+			sourceTree = "<group>";
+		};
+		A40000040000000000000001 /* App */ = {
+			isa = PBXGroup;
+			children = (
+				A20000010000000000000001 /* CineViewProApp.swift */,
+				A20000070000000000000001 /* Info.plist */,
+			);
+			path = App;
+			sourceTree = "<group>";
+		};
+		A40000050000000000000001 /* Protocol */ = {
+			isa = PBXGroup;
+			children = (
+				A20000040000000000000001 /* SonyPTPIPClient.swift */,
+			);
+			path = Protocol;
+			sourceTree = "<group>";
+		};
+		A40000060000000000000001 /* Rendering */ = {
+			isa = PBXGroup;
+			children = (
+				A20000030000000000000001 /* MonitorRenderer.swift */,
+				A20000060000000000000001 /* MonitorShaders.metal */,
+				A20000050000000000000001 /* TestPatternGenerator.swift */,
+			);
+			path = Rendering;
+			sourceTree = "<group>";
+		};
+		A40000070000000000000001 /* UI */ = {
+			isa = PBXGroup;
+			children = (
+				A20000020000000000000001 /* ContentView.swift */,
+			);
+			path = UI;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		A50000010000000000000001 /* CineViewPro */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A60000020000000000000001 /* Build configuration list for PBXNativeTarget "CineViewPro" */;
+			buildPhases = (
+				A70000010000000000000001 /* Sources */,
+				A30000010000000000000001 /* Frameworks */,
+				A70000020000000000000001 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = CineViewPro;
+			productName = CineViewPro;
+			productReference = A20000080000000000000001 /* CineViewPro.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		A80000010000000000000001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1600;
+				LastUpgradeCheck = 1600;
+				TargetAttributes = {
+					A50000010000000000000001 = {
+						CreatedOnToolsVersion = 16.0;
+					};
+				};
+			};
+			buildConfigurationList = A60000010000000000000001 /* Build configuration list for PBXProject "CineViewPro" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = zh_CN;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				zh_CN,
+				Base,
+			);
+			mainGroup = A40000010000000000000001;
+			productRefGroup = A40000020000000000000001 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				A50000010000000000000001 /* CineViewPro */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		A70000020000000000000001 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A10000060000000000000001 /* MonitorShaders.metal in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		A70000010000000000000001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A10000010000000000000001 /* CineViewProApp.swift in Sources */,
+				A10000020000000000000001 /* ContentView.swift in Sources */,
+				A10000030000000000000001 /* MonitorRenderer.swift in Sources */,
+				A10000040000000000000001 /* SonyPTPIPClient.swift in Sources */,
+				A10000050000000000000001 /* TestPatternGenerator.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		A90000010000000000000001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 6.0;
+			};
+			name = Debug;
+		};
+		A90000020000000000000001 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Release;
+		};
+		A90000030000000000000001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGNING_ALLOWED = YES;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 2MT6P562D2;
+				"EXCLUDED_ARCHS[sdk=iphonesimulator*]" = x86_64;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Sources/App/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.ddxd.cineviewpro;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		A90000040000000000000001 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGNING_ALLOWED = YES;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 2MT6P562D2;
+				"EXCLUDED_ARCHS[sdk=iphonesimulator*]" = x86_64;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Sources/App/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.ddxd.cineviewpro;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		A60000010000000000000001 /* Build configuration list for PBXProject "CineViewPro" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A90000010000000000000001 /* Debug */,
+				A90000020000000000000001 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		A60000020000000000000001 /* Build configuration list for PBXNativeTarget "CineViewPro" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A90000030000000000000001 /* Debug */,
+				A90000040000000000000001 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = A80000010000000000000001 /* Project object */;
+}
