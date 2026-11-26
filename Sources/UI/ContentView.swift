@@ -245,6 +245,7 @@ public final class MonitorViewModel {
     public var currentFPS: Int = 0
     public var currentResolutionLabel: String = ""
     public var currentFrameKB: Int = 0
+    public var videoSourceSize: CGSize = CGSize(width: 1920, height: 1080)
     public var ptpDiagnosticText: String = ""
     public var statusBannerMessage: String?
 
@@ -387,6 +388,11 @@ public final class MonitorViewModel {
             r.onScopeUpdate = { [weak self] result in
                 self?.latestScope = result
             }
+            r.onSourceSizeChange = { [weak self] size in
+                guard let self, size.width > 0, size.height > 0 else { return }
+                self.videoSourceSize = size
+                self.currentResolutionLabel = "\(Int(size.width))×\(Int(size.height))"
+            }
         } catch {
             self.renderer = nil
             self.rendererInitError = error.localizedDescription
@@ -451,6 +457,7 @@ public final class MonitorViewModel {
         currentFPS = 0
         currentResolutionLabel = ""
         currentFrameKB = 0
+        renderer?.resetAspectStabilizer()
         ptpDiagnosticText = ""
         currentExposureMode = nil
         shutterPresets = Self.fallbackShutterPresets

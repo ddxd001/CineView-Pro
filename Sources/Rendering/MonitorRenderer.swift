@@ -524,6 +524,9 @@ public final class MonitorRenderer: NSObject, MTKViewDelegate {
     /// 波形图 & RGB 直方图实时回调 (在主线程回调，便于直接更新 SwiftUI / UIKit 示波器视图)
     public var onScopeUpdate: (@MainActor @Sendable (ScopeAnalysisResult) -> Void)?
 
+    /// 已确认的视频源分辨率/宽高比变更回调 (用于同步红框 Tally 边框、构图参考线与设置页分辨率显示)
+    public var onSourceSizeChange: (@MainActor @Sendable (CGSize) -> Void)?
+
     // --- Metal 核心管线对象 ---
     public let device: MTLDevice
     private let commandQueue: MTLCommandQueue
@@ -547,6 +550,13 @@ public final class MonitorRenderer: NSObject, MTKViewDelegate {
     /// 复用的 CGImage 上传纹理与像素暂存区 (避免 30~60fps LiveView 频繁创建 MTLTexture)
     private var reusableRGBTexture: MTLTexture?
     private var reusableRGBBytes: [UInt8] = []
+
+    /// 画面宽高比防抖器：过滤 Sony 机身起录/停录切换编码管线瞬间吐出的 1~7 帧异常比例过渡帧，避免图传画面突然缩放一下再弹回
+    private var stableAspectRatio: Float = 0
+    private var pendingAspectRatio: Float = 0
+    private var pendingAspectFrameCount: Int = 0
+    private static let aspectTolerance: Float = 0.035
+    private static let aspectSwitchConfirmFrames = 8
 
     // --- 3D LUT 状态 ---
     private var activeLUTTexture: MTLTexture?
@@ -982,7 +992,7 @@ public final class MonitorRenderer: NSObject, MTKViewDelegate {
             self.activeChromaTexture = nil
             self.retainedCVTextures = [cvTex]
             self.activeInputFormat = 0
-            self.activeSourceSize = SIMD2<Float>(Float(width), Float(height))
+            self.updateActiveSourceSize(width: width, height: height)
 
         case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
              kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
@@ -1012,7 +1022,7 @@ public final class MonitorRenderer: NSObject, MTKViewDelegate {
             self.activeChromaTexture = uvTex
             self.retainedCVTextures = [cvY, cvUV]
             self.activeInputFormat = (pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) ? 1 : 2
-            self.activeSourceSize = SIMD2<Float>(Float(yWidth), Float(yHeight))
+            self.updateActiveSourceSize(width: yWidth, height: yHeight)
 
         case kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
              kCVPixelFormatType_420YpCbCr10BiPlanarFullRange:
@@ -1043,7 +1053,7 @@ public final class MonitorRenderer: NSObject, MTKViewDelegate {
             self.activeChromaTexture = uvTex
             self.retainedCVTextures = [cvY, cvUV]
             self.activeInputFormat = (pixelFormat == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange) ? 1 : 2
-            self.activeSourceSize = SIMD2<Float>(Float(yWidth), Float(yHeight))
+            self.updateActiveSourceSize(width: yWidth, height: yHeight)
 
         default:
             logger.warning("未识别的 CVPixelBuffer 像素格式: \(pixelFormat)，建议在 AVCaptureVideoDataOutput 指定 420YpCbCr8BiPlanarVideoRange 或 32BGRA。")
@@ -1072,11 +1082,56 @@ public final class MonitorRenderer: NSObject, MTKViewDelegate {
         return status == kCVReturnSuccess ? textureOut : nil
     }
 
+    /// 重置宽高比防抖状态（在断开重连或切换信号源时调用，确保首帧立即生效）
+    public func resetAspectStabilizer() {
+        stableAspectRatio = 0
+        pendingAspectRatio = 0
+        pendingAspectFrameCount = 0
+    }
+
+    /// 宽高比防抖判定：
+    /// - 同比例分辨率变化（如 640×360 ↔ 1024×576 ↔ 1920×1080）零延迟通过；
+    /// - 突发跨比例跳变（如 Sony 起录瞬间吐出 1~7 帧 4:3 / 3:2 过渡帧）需连续 8 帧一致才确认切换，否则保留上一帧避免画面闪缩。
+    private func shouldAcceptFrameSize(width: Int, height: Int) -> Bool {
+        guard width >= 160, height >= 120 else { return false }
+        let newAspect = Float(width) / Float(height)
+
+        if stableAspectRatio <= 0 || abs(newAspect - stableAspectRatio) <= Self.aspectTolerance {
+            stableAspectRatio = newAspect
+            pendingAspectFrameCount = 0
+            return true
+        }
+
+        if abs(newAspect - pendingAspectRatio) <= Self.aspectTolerance {
+            pendingAspectFrameCount += 1
+        } else {
+            pendingAspectRatio = newAspect
+            pendingAspectFrameCount = 1
+        }
+
+        guard pendingAspectFrameCount >= Self.aspectSwitchConfirmFrames else {
+            return false
+        }
+
+        stableAspectRatio = newAspect
+        pendingAspectFrameCount = 0
+        return true
+    }
+
+    private func updateActiveSourceSize(width: Int, height: Int) {
+        let newSize = SIMD2<Float>(Float(width), Float(height))
+        let changed = (activeSourceSize.x != newSize.x || activeSourceSize.y != newSize.y)
+        activeSourceSize = newSize
+        if changed {
+            onSourceSizeChange?(CGSize(width: width, height: height))
+        }
+    }
+
     /// 将来自 `SonyPTPIPClient` 的 `CGImage` 高效上传到复用的 `MTLTexture` (零每帧纹理重分配)
     private func ingestCGImage(_ cgImage: CGImage) {
         let width = cgImage.width
         let height = cgImage.height
-        guard width > 0, height > 0 else { return }
+        guard shouldAcceptFrameSize(width: width, height: height) else { return }
 
         let bytesPerRow = width * 4
         let totalBytes = bytesPerRow * height
@@ -1129,7 +1184,7 @@ public final class MonitorRenderer: NSObject, MTKViewDelegate {
         self.activeChromaTexture = nil
         self.retainedCVTextures = []
         self.activeInputFormat = 0
-        self.activeSourceSize = SIMD2<Float>(Float(width), Float(height))
+        self.updateActiveSourceSize(width: width, height: height)
     }
 
     // MARK: - 占位纹理生成辅助

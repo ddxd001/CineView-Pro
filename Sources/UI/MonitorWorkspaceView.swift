@@ -1102,7 +1102,7 @@ struct MonitorWorkspaceView: View {
 
     /// 计算与 `MonitorShaders.metal` 完全一致的有效视频矩形 (含变形镜头反挤压倍率)
     private func computeActiveVideoRect(in containerSize: CGSize) -> CGRect {
-        let src = vm.renderer?.currentSourceSize ?? CGSize(width: 1920, height: 1080)
+        let src = vm.videoSourceSize
         let srcW = max(src.width, 1)
         let srcH = max(src.height, 1)
         let effectiveAspect = (srcW / srcH) * CGFloat(max(vm.renderSettings.desqueeze.rawValue, 1.0))
