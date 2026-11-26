@@ -534,6 +534,11 @@ public struct SonyExposureProgramMode: Equatable, Hashable, Sendable, CustomStri
         UInt16(rawValue & 0xFFFF)
     }
 
+    /// 高 16 位分组/槽位码（仅 SDI3 UInt32 有效，例如 MR 记忆调出槽位或拍摄组别）
+    public var groupCode: UInt16 {
+        UInt16((rawValue >> 16) & 0xFFFF)
+    }
+
     /// 是否处于视频 / S&Q / HFR 摄像模式
     public var isMovieMode: Bool {
         switch modeCode {
@@ -544,9 +549,10 @@ public struct SonyExposureProgramMode: Equatable, Hashable, Sendable, CustomStri
         }
     }
 
-    /// 左下角角标短名称（如 `A`, `M`, `S`, `P`, `AUTO`, `M·A`, `S&Q M`）
+    /// 档位短名称（如 `A`, `M`, `S`, `P`, `AUTO`, `1`, `2`, `3`, `MR`, `MOVIE M`, `S&Q M`）
     public var shortBadge: String {
         switch modeCode {
+        case 0x0000: return "--"
         case 0x0001: return "M"
         case 0x0002: return "P"
         case 0x0003: return "A"
@@ -556,7 +562,16 @@ public struct SonyExposureProgramMode: Equatable, Hashable, Sendable, CustomStri
         case 0x8008: return "P·A"
         case 0x8009: return "P·S"
         case 0x8011...0x801C: return "SCN"
-        case 0x8020: return "MR"
+        case 0x8020:
+            if (1...3).contains(groupCode) { return "\(groupCode)" }
+            return "MR"
+        case 0x8021: return "1"
+        case 0x8022: return "2"
+        case 0x8023: return "3"
+        case 0x8024: return "M1"
+        case 0x8025: return "M2"
+        case 0x8026: return "M3"
+        case 0x8027: return "M4"
         case 0x8040, 0x8041: return "PANO"
         case 0x8050: return "MOVIE P"
         case 0x8051: return "MOVIE A"
@@ -590,6 +605,7 @@ public struct SonyExposureProgramMode: Equatable, Hashable, Sendable, CustomStri
     /// 中文可读说明
     public var displayName: String {
         switch modeCode {
+        case 0x0000: return "--"
         case 0x0001: return "M 手动曝光"
         case 0x0002: return "P 程序自动"
         case 0x0003: return "A 光圈优先"
@@ -597,7 +613,16 @@ public struct SonyExposureProgramMode: Equatable, Hashable, Sendable, CustomStri
         case 0x8000: return "AUTO 智能自动"
         case 0x8001: return "AUTO+ 增强自动"
         case 0x8011...0x801C: return "SCN 场景选择"
-        case 0x8020: return "MR 调出存储"
+        case 0x8020:
+            if (1...3).contains(groupCode) { return "调出存储 \(groupCode)" }
+            return "MR 调出存储"
+        case 0x8021: return "调出存储 1"
+        case 0x8022: return "调出存储 2"
+        case 0x8023: return "调出存储 3"
+        case 0x8024: return "存储卡记忆 M1"
+        case 0x8025: return "存储卡记忆 M2"
+        case 0x8026: return "存储卡记忆 M3"
+        case 0x8027: return "存储卡记忆 M4"
         case 0x8050: return "视频 P"
         case 0x8051: return "视频 A"
         case 0x8052: return "视频 S"
@@ -1903,7 +1928,10 @@ public actor SonyPTPIPClient {
             }
             return "\(d.getSet)/\(d.isEnabled)/\(formTag)"
         }
-        let modeLabel = exposureMode?.shortBadge ?? "-"
+        let modeLabel: String = {
+            guard let m = exposureMode else { return "-" }
+            return String(format: "%@(0x%08X)", m.shortBadge, m.rawValue)
+        }()
         let diagBase = "\(isSDI3 ? "SDI3" : "SDI2") 0x9209: \(resp.data.count)B, \(props.count)/\(parseOutcome.declaredCount)项 | 档位:\(modeLabel) | F:\(availableApertures.count)[\(flagTag(apertureDesc))] SS:\(availableShutterSpeeds.count)[\(flagTag(shutterDesc))] ISO:\(availableISOs.count)[\(flagTag(isoDesc))]"
         let diag = parseOutcome.stopReason.isEmpty ? diagBase : "\(diagBase) | \(parseOutcome.stopReason)"
 

@@ -139,40 +139,41 @@ struct MonitorWorkspaceView: View {
 
     private var leftExposureStack: some View {
         VStack(spacing: 5) {
-            // 顶部：纯色连接状态圆点（无文字） + 放大单字母档位
-            HStack(spacing: 4) {
-                Button {
-                    let haptic = UIImpactFeedbackGenerator(style: .light)
-                    haptic.impactOccurred()
-                    vm.openSettings(tab: .connect)
-                } label: {
+            // 顶部：纯色连接状态圆点 + 档位字母（整张卡片可点击打开设置抽屉）
+            Button {
+                let haptic = UIImpactFeedbackGenerator(style: .light)
+                haptic.impactOccurred()
+                let isLive = vm.isCameraConnected || vm.isUVCActive || vm.isTestPatternActive
+                vm.openSettings(tab: isLive ? .assist : .connect)
+            } label: {
+                HStack(spacing: 3) {
                     Circle()
                         .fill(connectionStatusColor)
-                        .frame(width: 9, height: 9)
-                        .shadow(color: connectionStatusColor.opacity(0.85), radius: 5)
-                        .frame(width: 24, height: 28)
-                        .contentShape(Rectangle())
+                        .frame(width: 8, height: 8)
+                        .shadow(color: connectionStatusColor.opacity(0.85), radius: 4)
+                        .frame(width: 14, height: 24)
+
+                    Spacer(minLength: 2)
+
+                    Text(exposureModeLetter)
+                        .font(exposureModeFont)
+                        .foregroundStyle(vm.currentExposureMode != nil ? MonitorTheme.accentAmber : .white.opacity(0.45))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.55)
+                        .allowsTightening(true)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-                .buttonStyle(.plain)
-                .accessibilityLabel("连接状态")
-
-                Spacer(minLength: 0)
-
-                Text(exposureModeLetter)
-                    .font(.robotoFlex(size: 25, weight: 800, width: 96))
-                    .foregroundStyle(vm.currentExposureMode != nil ? MonitorTheme.accentAmber : .white.opacity(0.45))
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.48)
-                    .padding(.trailing, 2)
+                .padding(.horizontal, 6)
+                .frame(height: 44)
+                .frame(maxWidth: .infinity)
+                .background(MonitorTheme.surface, in: RoundedRectangle(cornerRadius: MonitorTheme.cardRadius, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: MonitorTheme.cardRadius, style: .continuous)
+                        .stroke(MonitorTheme.border, lineWidth: 0.6)
+                )
             }
-            .padding(.horizontal, 6)
-            .frame(height: 44)
-            .frame(maxWidth: .infinity)
-            .background(MonitorTheme.surface, in: RoundedRectangle(cornerRadius: MonitorTheme.cardRadius, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: MonitorTheme.cardRadius, style: .continuous)
-                    .stroke(MonitorTheme.border, lineWidth: 0.6)
-            )
+            .buttonStyle(.plain)
+            .accessibilityLabel("连接状态与设置")
 
             // 5 项核心曝光参数均匀排布
             exposureCard(
@@ -696,7 +697,7 @@ struct MonitorWorkspaceView: View {
 
                 Spacer()
 
-                // 底部：纯白无文字图标按钮（相册预览 + 清屏 + 设置）
+                // 底部：纯白无文字图标按钮（相册预览 + 清屏）
                 VStack(spacing: 6) {
                     Button {
                         let haptic = UIImpactFeedbackGenerator(style: .light)
@@ -750,24 +751,6 @@ struct MonitorWorkspaceView: View {
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel("清屏")
-
-                    Button {
-                        let haptic = UIImpactFeedbackGenerator(style: .light)
-                        haptic.impactOccurred()
-                        vm.openSettings(tab: .assist)
-                    } label: {
-                        Image(systemName: "gearshape")
-                            .font(.system(size: 15, weight: .medium))
-                            .foregroundStyle(.white)
-                            .frame(width: 44, height: 33)
-                            .background(MonitorTheme.surface, in: RoundedRectangle(cornerRadius: MonitorTheme.cardRadius, style: .continuous))
-                            .overlay(
-                                RoundedRectangle(cornerRadius: MonitorTheme.cardRadius, style: .continuous)
-                                    .stroke(MonitorTheme.border, lineWidth: 0.6)
-                            )
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("设置")
                 }
                 .padding(.bottom, 10)
             }
@@ -861,31 +844,17 @@ struct MonitorWorkspaceView: View {
                 .foregroundStyle(.white.opacity(0.55))
                 .multilineTextAlignment(.center)
 
-            HStack(spacing: 10) {
-                Button {
-                    Task { await vm.startTestPattern() }
-                } label: {
-                    Text("测试信号")
-                        .font(.robotoFlex(size: 12, weight: 700))
-                        .foregroundStyle(.black)
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 8)
-                        .background(MonitorTheme.accentAmber, in: Capsule())
-                }
-                .buttonStyle(.plain)
-
-                Button {
-                    vm.openSettings(tab: .connect)
-                } label: {
-                    Text("连接相机")
-                        .font(.robotoFlex(size: 12, weight: 600))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 8)
-                        .background(Color.white.opacity(0.14), in: Capsule())
-                }
-                .buttonStyle(.plain)
+            Button {
+                vm.openSettings(tab: .connect)
+            } label: {
+                Text("连接相机")
+                    .font(.robotoFlex(size: 12.5, weight: 700))
+                    .foregroundStyle(.black)
+                    .padding(.horizontal, 22)
+                    .padding(.vertical, 9)
+                    .background(MonitorTheme.accentAmber, in: Capsule())
             }
+            .buttonStyle(.plain)
             .padding(.top, 2)
         }
         .padding(22)
@@ -905,12 +874,13 @@ struct MonitorWorkspaceView: View {
         return Color.white.opacity(0.32)
     }
 
-    /// 档位纯字母提取（例如 A 光圈优先 -> "A"，MOVIE M -> "M"，S&Q S -> "S"）
+    /// 档位紧凑标识（例如 A 光圈优先 -> "A"，MOVIE M -> "M"，AUTO -> "AUTO"，记忆调出 1/2/3 -> "1"/"2"/"3"）
     private var exposureModeLetter: String {
         guard let mode = vm.currentExposureMode else {
             return vm.isTestPatternActive ? "M" : "--"
         }
         switch mode.modeCode {
+        case 0x0000:                                         return "--"
         case 0x0001, 0x8053, 0x805C, 0x8087, 0x8083, 0x8096: return "M"
         case 0x0002, 0x8050, 0x8059, 0x8084, 0x8080, 0x8093: return "P"
         case 0x0003, 0x8051, 0x805A, 0x8085, 0x8081, 0x8094: return "A"
@@ -919,8 +889,29 @@ struct MonitorWorkspaceView: View {
         case 0x8000, 0x8054, 0x805D, 0x8097:                 return "AUTO"
         case 0x8001:                                         return "A+"
         case 0x8011...0x801C:                                return "SCN"
-        case 0x8020:                                         return "MR"
+        case 0x8020:
+            if (1...3).contains(mode.groupCode) { return "\(mode.groupCode)" }
+            return "MR"
+        case 0x8021:                                         return "1"
+        case 0x8022:                                         return "2"
+        case 0x8023:                                         return "3"
+        case 0x8024:                                         return "M1"
+        case 0x8025:                                         return "M2"
+        case 0x8026:                                         return "M3"
+        case 0x8027:                                         return "M4"
+        case 0x8088:                                         return "MOV"
+        case 0x8089:                                         return "STL"
         default:                                             return mode.shortBadge
+        }
+    }
+
+    /// 按档位文字长度自适应 Roboto Flex 字号与字宽，确保 4 字母 `AUTO` 等完整清晰显示不裁切
+    private var exposureModeFont: Font {
+        switch exposureModeLetter.count {
+        case ...1: return .robotoFlex(size: 24, weight: 800, width: 96)
+        case 2:    return .robotoFlex(size: 18, weight: 800, width: 88)
+        case 3:    return .robotoFlex(size: 15, weight: 800, width: 82)
+        default:   return .robotoFlex(size: 13.5, weight: 800, width: 76)
         }
     }
 
@@ -1080,7 +1071,7 @@ struct MonitorWorkspaceView: View {
 
     // MARK: - 安全区灵动岛智能避让与视频几何映射
 
-    /// 横屏时仅对灵动岛所在侧施加避让边距，对侧保持紧凑外距以最大化中间图传面积
+    /// 横屏时仅对灵动岛所在侧施加完整硬件安全区避让（不再人为截断为 48pt，彻底避免 iPhone Pro Max 灵动岛遮挡），对侧保持紧凑外距以最大化中间图传面积
     private func resolvedHorizontalEdgeInsets(for geo: GeometryProxy) -> (leading: CGFloat, trailing: CGFloat) {
         let windowScene = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
         let keyWindow = windowScene?.windows.first(where: \.isKeyWindow)
@@ -1088,24 +1079,24 @@ struct MonitorWorkspaceView: View {
         let rawTrailing = max(geo.safeAreaInsets.trailing, keyWindow?.safeAreaInsets.right ?? 0)
 
         let minEdge: CGFloat = 10
-        let maxNotchClearance: CGFloat = 48
+        let islandExtraMargin: CGFloat = 4
 
         guard max(rawLeading, rawTrailing) >= 36 else {
             return (minEdge, minEdge)
         }
 
+        let leadingClearance = max(rawLeading, minEdge) + islandExtraMargin
+        let trailingClearance = max(rawTrailing, minEdge) + islandExtraMargin
+
         switch windowScene?.interfaceOrientation {
         case .landscapeRight:
-            // Home 指示条在右，灵动岛/听筒在左侧
-            return (min(max(rawLeading, minEdge), maxNotchClearance), minEdge)
+            // 灵动岛/听筒位于左侧，给左侧栏完整安全区避让
+            return (leadingClearance, minEdge)
         case .landscapeLeft:
-            // Home 指示条在左，灵动岛/听筒在右侧
-            return (minEdge, min(max(rawTrailing, minEdge), maxNotchClearance))
+            // 灵动岛/听筒位于右侧，给右侧栏完整安全区避让
+            return (minEdge, trailingClearance)
         default:
-            return (
-                min(max(rawLeading, minEdge), maxNotchClearance),
-                min(max(rawTrailing, minEdge), maxNotchClearance)
-            )
+            return (leadingClearance, trailingClearance)
         }
     }
 
