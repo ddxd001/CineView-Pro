@@ -783,6 +783,16 @@ public struct SonyDevicePropertyDescriptor: Sendable {
         guard currentValueBytes.count >= 4 else { return nil }
         return currentValueBytes.readUInt32LE(at: 0)
     }
+
+    /// 按属性实际字节宽度自动读取无符号整数值（兼容 UInt8 / UInt16 / UInt32，例如 Sony 0xD21D 录制状态在部分固件为 UInt8、部分为 UInt16）
+    public var unsignedIntValue: UInt32? {
+        switch currentValueBytes.count {
+        case 1: return uint8Value.map(UInt32.init)
+        case 2: return uint16Value.map(UInt32.init)
+        case 4...: return uint32Value
+        default: return nil
+        }
+    }
 }
 
     /// 相机常用曝光与状态快照
@@ -806,7 +816,8 @@ public struct CameraStateSnapshot: Sendable {
     public let exposureBias: SonyExposureBias?
     /// 当前机身拍摄曝光档位 (来自 0x500E ExposureProgramMode，如 A / S / M / P / Movie M)
     public let exposureProgramMode: SonyExposureProgramMode?
-    public let isRecording: Bool
+    /// nil 表示本次 0x9209 未包含 0xD21D；true/false 表示相机明确回报录制状态 (0xD21D == 1)
+    public let isRecording: Bool?
     public let isLiveViewEnabled: Bool
     /// 相机内存待拉取的新拍照片状态 (`0xD215`, >= 0x8000 表示 `0xFFFFC001` 有新照片就绪)
     public let objectInMemory: UInt16?
@@ -1914,8 +1925,10 @@ public actor SonyPTPIPClient {
         let wb = props[SonyPTPPropCode.whiteBalance.rawValue]?.uint16Value.map(SonyWhiteBalance.init(wireValue:))
         let colorTemp = props[SonyPTPPropCode.colorTemperature.rawValue]?.uint16Value
         let evBias = props[SonyPTPPropCode.exposureBias.rawValue]?.int16Value.map(SonyExposureBias.init(rawMilliEV:))
-        let isRecording = (props[SonyPTPPropCode.recordingState.rawValue]?.uint16Value ?? 0) != 0
-        let isLiveViewEnabled = (props[SonyPTPPropCode.liveViewStatus.rawValue]?.uint8Value ?? 0) != 0
+        // 0xD21D (MovieRecordingState): A6700/Sony PTP 为 UInt8 (1B) 或 UInt16 (2B)，0=待机, 1=录制中, 2=录制失败
+        let recordingRaw = props[SonyPTPPropCode.recordingState.rawValue]?.unsignedIntValue
+        let isRecording: Bool? = recordingRaw.map { $0 == 1 }
+        let isLiveViewEnabled = (props[SonyPTPPropCode.liveViewStatus.rawValue]?.unsignedIntValue ?? 0) != 0
         let objectInMemory = props[SonyPTPPropCode.objectInMemory.rawValue]?.uint16Value
 
         func flagTag(_ desc: SonyDevicePropertyDescriptor?) -> String {
@@ -1932,7 +1945,8 @@ public actor SonyPTPIPClient {
             guard let m = exposureMode else { return "-" }
             return String(format: "%@(0x%08X)", m.shortBadge, m.rawValue)
         }()
-        let diagBase = "\(isSDI3 ? "SDI3" : "SDI2") 0x9209: \(resp.data.count)B, \(props.count)/\(parseOutcome.declaredCount)项 | 档位:\(modeLabel) | F:\(availableApertures.count)[\(flagTag(apertureDesc))] SS:\(availableShutterSpeeds.count)[\(flagTag(shutterDesc))] ISO:\(availableISOs.count)[\(flagTag(isoDesc))]"
+        let recLabel = recordingRaw.map(String.init) ?? "-"
+        let diagBase = "\(isSDI3 ? "SDI3" : "SDI2") 0x9209: \(resp.data.count)B, \(props.count)/\(parseOutcome.declaredCount)项 | 档位:\(modeLabel) REC:\(recLabel) | F:\(availableApertures.count)[\(flagTag(apertureDesc))] SS:\(availableShutterSpeeds.count)[\(flagTag(shutterDesc))] ISO:\(availableISOs.count)[\(flagTag(isoDesc))]"
         let diag = parseOutcome.stopReason.isEmpty ? diagBase : "\(diagBase) | \(parseOutcome.stopReason)"
 
         return CameraStateSnapshot(
@@ -2128,14 +2142,14 @@ public actor SonyPTPIPClient {
     /// 幂等开始录制：先查询 `0xD21D` 录制状态，仅在未录制时触发 REC 按键
     public func startRecording() async throws {
         let state = try await fetchCameraState()
-        guard !state.isRecording else { return }
+        guard state.isRecording != true else { return }
         try await toggleRecording()
     }
 
     /// 幂等停止录制：先查询 `0xD21D` 录制状态，仅在录制中时触发 REC 按键
     public func stopRecording() async throws {
         let state = try await fetchCameraState()
-        guard state.isRecording else { return }
+        guard state.isRecording != false else { return }
         try await toggleRecording()
     }
 

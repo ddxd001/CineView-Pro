@@ -330,6 +330,8 @@ public final class MonitorViewModel {
     private var eventSyncTask: Task<Void, Never>?
     private var eventDebounceTask: Task<Void, Never>?
     private var recordingTimerTask: Task<Void, Never>?
+    private var recordingTransitionDeadline: ContinuousClock.Instant?
+    private var expectedRecordingState: Bool?
     private var reticleDismissTask: Task<Void, Never>?
     private var bannerDismissTask: Task<Void, Never>?
 
@@ -427,6 +429,10 @@ public final class MonitorViewModel {
         eventDebounceTask = nil
         recordingTimerTask?.cancel()
         recordingTimerTask = nil
+        recordingTransitionDeadline = nil
+        expectedRecordingState = nil
+        isRecording = false
+        recordingSeconds = 0
 
         uvcController?.stop()
         uvcController = nil
@@ -705,9 +711,26 @@ public final class MonitorViewModel {
             batteryPercent = min(100, Int(bat))
         }
 
-        if snap.isRecording != isRecording {
-            isRecording = snap.isRecording
-            updateRecordingTimer(active: isRecording)
+        if let remoteRec = snap.isRecording {
+            if let deadline = recordingTransitionDeadline, let expected = expectedRecordingState {
+                if remoteRec == expected {
+                    // 相机已确认进入目标录制状态，结束保护期
+                    recordingTransitionDeadline = nil
+                    expectedRecordingState = nil
+                } else if ContinuousClock.now < deadline {
+                    // 相机起录/停录切换窗口期（约 0.3~1.0s）内暂不把刚点亮的状态覆盖回去
+                } else {
+                    recordingTransitionDeadline = nil
+                    expectedRecordingState = nil
+                    if remoteRec != isRecording {
+                        isRecording = remoteRec
+                        updateRecordingTimer(active: isRecording)
+                    }
+                }
+            } else if remoteRec != isRecording {
+                isRecording = remoteRec
+                updateRecordingTimer(active: isRecording)
+            }
         }
 
         // 兜底检测 ObjectInMemory (0xD215 >= 0x8000)：即使错过 0xC201 事件也能自动拉取刚拍照片
@@ -828,16 +851,25 @@ public final class MonitorViewModel {
             return
         }
         Task {
+            let targetState = !isRecording
             do {
-                if isRecording {
-                    try await client.stopRecording()
-                    isRecording = false
-                } else {
+                // 先设置 1.8s 起录/停录状态过渡保护，避免 0xC203 在机身起录准备阶段（0.3~0.6s）短暂回读 0 把红框冲掉
+                expectedRecordingState = targetState
+                recordingTransitionDeadline = ContinuousClock.now.advanced(by: .milliseconds(1800))
+
+                if targetState {
                     try await client.startRecording()
                     isRecording = true
+                } else {
+                    try await client.stopRecording()
+                    isRecording = false
                 }
                 updateRecordingTimer(active: isRecording)
+                // 延迟 700ms 主动拉取一次 0x9209 校验机身真实录制状态
+                scheduleDebouncedStateSync(delayMs: 700)
             } catch {
+                recordingTransitionDeadline = nil
+                expectedRecordingState = nil
                 showBanner("录制指令失败: \(error.localizedDescription)")
             }
         }

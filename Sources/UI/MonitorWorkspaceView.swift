@@ -124,7 +124,7 @@ struct MonitorWorkspaceView: View {
                     .transition(.opacity)
             }
         }
-        .padding(.vertical, 10)
+        .padding(.vertical, 16)
         .padding(.leading, leadingInset)
         .padding(.trailing, 7)
         .frame(width: leftRailWidth + leadingInset)
@@ -693,7 +693,7 @@ struct MonitorWorkspaceView: View {
                         .buttonStyle(.plain)
                     }
                 }
-                .padding(.top, 12)
+                .padding(.top, 22)
 
                 Spacer()
 
@@ -752,7 +752,7 @@ struct MonitorWorkspaceView: View {
                     .buttonStyle(.plain)
                     .accessibilityLabel("清屏")
                 }
-                .padding(.bottom, 10)
+                .padding(.bottom, 22)
             }
 
             // 严格上下居中：独立电影机 REC 录制键（无 STBY 文字，仅录制中在下方叠加红字时间码）
@@ -1078,7 +1078,7 @@ struct MonitorWorkspaceView: View {
         let rawLeading = max(geo.safeAreaInsets.leading, keyWindow?.safeAreaInsets.left ?? 0)
         let rawTrailing = max(geo.safeAreaInsets.trailing, keyWindow?.safeAreaInsets.right ?? 0)
 
-        let minEdge: CGFloat = 10
+        let minEdge: CGFloat = 18
         let islandExtraMargin: CGFloat = 4
 
         guard max(rawLeading, rawTrailing) >= 36 else {
